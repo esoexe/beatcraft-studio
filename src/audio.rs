@@ -838,7 +838,7 @@ mod mastering_tests {
         let out = render(&project, 22_050).expect("render");
         let peak = out.iter().fold(0.0f32, |p, s| p.max(s.abs()));
         assert!(
-            out.len() % 2 == 0 && peak <= 0.4 + 1e-3,
+            out.len().is_multiple_of(2) && peak <= 0.4 + 1e-3,
             "render peak {peak} over suite ceiling"
         );
     }

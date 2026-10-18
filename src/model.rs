@@ -112,17 +112,13 @@ pub struct AutomationLane {
     pub points: Vec<AutomationPoint>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WavBitDepth {
+    #[default]
     Sixteen,
     TwentyFour,
     Float32,
-}
-impl Default for WavBitDepth {
-    fn default() -> Self {
-        Self::Sixteen
-    }
 }
 
 /// Master-bus mastering chain: 3-band EQ → stereo width → compressor → limiter.
