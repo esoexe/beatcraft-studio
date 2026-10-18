@@ -77,13 +77,13 @@ jobs:
             mkdir "$pkg" && cp LICENSE README.md "$pkg/" && cp target/release/beatcraft-* "$pkg/" 2>/dev/null || true
             tar -czf "${pkg}.tar.gz" "$pkg"
           fi
-          # glob-safe listing + churn out SHASUMS.txt for the release notes
+          # glob-safe listing + per-OS checksums (merged in the release job)
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${pkg}".* > SHASUMS.txt
+            sha256sum "${pkg}".* > "SHASUMS-${OS}.txt"
           else
-            shasum -a 256 "${pkg}".* > SHASUMS.txt
+            shasum -a 256 "${pkg}".* > "SHASUMS-${OS}.txt"
           fi
-          cat SHASUMS.txt
+          cat "SHASUMS-${OS}.txt"
 
       - name: Upload packaged archives
         uses: actions/upload-artifact@v4
@@ -91,7 +91,7 @@ jobs:
           name: BeatCraft-pkg-${{ runner.os }}-${{ github.ref_name }}
           path: |
             beatcraft-studio-${{ github.ref_name }}-*
-            SHASUMS.txt
+            SHASUMS-${{ runner.os }}.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -106,6 +106,9 @@ jobs:
         with:
           pattern: BeatCraft-pkg-*
           merge-multiple: true
+
+      - name: Merge checksums
+        run: cat SHASUMS-*.txt > SHASUMS.txt && cat SHASUMS.txt
 
       - name: Checksums and publish
         uses: softprops/action-gh-release@v2
