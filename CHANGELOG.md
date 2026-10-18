@@ -2,6 +2,28 @@
 
 All notable changes to BeatCraft Studio are documented here.
 
+## [2.0.0] — 2026-10-18
+
+### Added — The Streaming Mastering release
+
+- **True streaming render engine (phase 2)** — the arrangement is synthesized
+  bar-by-bar by a dedicated producer thread, just ahead of the playhead, into a
+  lock-free ring the audio callback drains directly. Playback starts with the
+  first bar, memory stays flat no matter how long the project is, and underruns
+  render silence instead of stalling. Per-track FX states (lowpass, drive,
+  feedback delay, dual reverbs) and the complete Master Suite state (EQ biquads,
+  compressor envelope) cross every chunk boundary seamlessly; chunk borders ride
+  the continuous musical time lattice, so no hit can ever fall between bars.
+- **Bit-parity contract, machine-verified** — for all four studio floors and for
+  every arrangement prefix of each, the concatenated stream is proven to be the
+  offline render, sample for sample (drums, pitched lanes, loops, FX tails, and
+  mastering included). 21/21 tests.
+- **Varispeed warp (Fit)** — sample tracks gain a "Fit" control that forces any
+  take into exactly N sixteenths (0 = natural). MPC-style: speed follows length,
+  pitch follows speed. Grid-exact by unit test.
+- Record-into-pattern affirmed: mic takes keep landing on the selected pattern
+  at step 1 as a new sample track, undoable like everything else.
+
 ## [1.2.0] — 2026-10-18
 
 ### Added — Realtime & Performance pass

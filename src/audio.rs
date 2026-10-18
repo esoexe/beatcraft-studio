@@ -108,10 +108,38 @@ pub fn render(project: &Project, sample_rate: u32) -> Result<Vec<f32>> {
     render_with_progress(project, sample_rate, None)
 }
 
+/// The complete mix signal chain up to and including the Master Suite, **before**
+/// the global ceiling normalize. This is the reference the streaming engine must
+/// reproduce sample-for-sample.
+pub fn render_core(project: &Project, sample_rate: u32) -> Result<Vec<f32>> {
+    render_core_impl(project, sample_rate, None)
+}
+
 /// Same renderer as [`render`], optionally invoking `progress(0.0..=1.0)` as each
 /// arrangement bar is synthesized. Parallel/deterministic — progress is a pure
 /// side-channel and never changes the audio.
 pub fn render_with_progress(
+    project: &Project,
+    sample_rate: u32,
+    progress: Option<&mut dyn FnMut(f32)>,
+) -> Result<Vec<f32>> {
+    let mut mix = render_core_impl(project, sample_rate, progress)?;
+    let ceiling = if project.master_suite.limiter_enabled {
+        project.master_suite.limiter_ceiling.clamp(0.3, 1.0)
+    } else {
+        1.0
+    };
+    let peak = mix.iter().fold(0.0_f32, |p, s| p.max(s.abs()));
+    if peak > ceiling {
+        let scale = ceiling / peak;
+        for sample in &mut mix {
+            *sample *= scale;
+        }
+    }
+    Ok(mix)
+}
+
+fn render_core_impl(
     project: &Project,
     sample_rate: u32,
     mut progress: Option<&mut dyn FnMut(f32)>,
@@ -175,7 +203,12 @@ pub fn render_with_progress(
                                                 .insert(sample.path.clone(), decoded.clone());
                                             decoded
                                         };
-                                        let voice = trim_and_resample(&clip, sample, sample_rate);
+                                        let voice = trim_and_resample(
+                                            &clip,
+                                            sample,
+                                            sample_rate,
+                                            step_seconds as f64 * sample_rate as f64,
+                                        );
                                         if sample.looped {
                                             let next_step = ((step + 1)..STEPS)
                                                 .find(|next| {
@@ -273,19 +306,7 @@ pub fn render_with_progress(
         *sample = (*sample * master * (1.0 + drive * 3.0)).tanh();
         peak = peak.max(sample.abs());
     }
-    apply_master_suite(&mut mix, &project.master_suite, sample_rate);
-    let ceiling = if project.master_suite.limiter_enabled {
-        project.master_suite.limiter_ceiling.clamp(0.3, 1.0)
-    } else {
-        1.0
-    };
-    let peak = mix.iter().fold(0.0_f32, |p, s| p.max(s.abs()));
-    if peak > ceiling {
-        let scale = ceiling / peak;
-        for sample in &mut mix {
-            *sample *= scale;
-        }
-    }
+    MasterSuiteState::new(&project.master_suite, sample_rate).process(&mut mix);
     Ok(mix)
 }
 
@@ -373,79 +394,107 @@ impl Biquad {
     }
 }
 
+/// Persistent mastering-chain state (EQ biquads + compressor envelope survive
+/// chunk boundaries). Emitted in the fixed stage order: EQ → width → comp → limiter.
+struct MasterSuiteState {
+    eq: Option<([Biquad; 3], [Biquad; 3])>,
+    width: Option<f32>,
+    comp: Option<(f32, f32, f32, f32, f32, f32)>, // att, rel, threshold, ratio, makeup, env
+    limiter: Option<f32>,
+}
+impl MasterSuiteState {
+    fn new(suite: &crate::model::MasterSuite, sr: u32) -> Self {
+        let eq = if suite.eq_enabled
+            && (suite.eq_low_db.abs() > 0.01
+                || suite.eq_mid_db.abs() > 0.01
+                || suite.eq_high_db.abs() > 0.01)
+        {
+            let lx = [
+                Biquad::low_shelf(sr, 120.0, suite.eq_low_db),
+                Biquad::peak(sr, 1200.0, suite.eq_mid_db, 0.9),
+                Biquad::high_shelf(sr, 6500.0, suite.eq_high_db),
+            ];
+            Some((lx, lx))
+        } else {
+            None
+        };
+        let width =
+            ((suite.stereo_width - 1.0).abs() > 0.001).then(|| suite.stereo_width.clamp(0.0, 2.0));
+        let comp = suite.comp_enabled.then(|| {
+            (
+                (-1.0 / (0.004 * sr as f32)).exp(),
+                (-1.0 / (0.09 * sr as f32)).exp(),
+                10f32.powf(suite.comp_threshold_db.clamp(-60.0, 0.0) / 20.0),
+                suite.comp_ratio.clamp(1.0, 20.0),
+                10f32.powf(suite.comp_makeup_db.clamp(0.0, 24.0) / 20.0),
+                0.0f32,
+            )
+        });
+        let limiter = suite
+            .limiter_enabled
+            .then(|| suite.limiter_ceiling.clamp(0.3, 1.0));
+        Self {
+            eq,
+            width,
+            comp,
+            limiter,
+        }
+    }
+
+    fn process(&mut self, mix: &mut [f32]) {
+        if let Some((lx, rx)) = &mut self.eq {
+            for i in (0..mix.len()).step_by(2) {
+                let (mut l, mut r) = (mix[i], mix[i + 1]);
+                for f in lx.iter_mut() {
+                    l = f.run(l);
+                }
+                for f in rx.iter_mut() {
+                    r = f.run(r);
+                }
+                mix[i] = l;
+                mix[i + 1] = r;
+            }
+        }
+        if let Some(w) = self.width {
+            for i in (0..mix.len()).step_by(2) {
+                let mid = (mix[i] + mix[i + 1]) * 0.5;
+                let side = (mix[i] - mix[i + 1]) * 0.5 * w;
+                mix[i] = mid + side;
+                mix[i + 1] = mid - side;
+            }
+        }
+        if let Some((att, rel, threshold, ratio, makeup, env)) = &mut self.comp {
+            for i in (0..mix.len()).step_by(2) {
+                let peak = mix[i].abs().max(mix[i + 1].abs());
+                *env = if peak > *env {
+                    *att * *env + (1.0 - *att) * peak
+                } else {
+                    *rel * *env + (1.0 - *rel) * peak
+                };
+                let mut gain = 1.0f32;
+                if *env > *threshold {
+                    let over_db = 20.0 * (*env / (*threshold).max(1e-9)).log10();
+                    let gain_db = -over_db * (1.0 - 1.0 / *ratio);
+                    gain = 10f32.powf(gain_db / 20.0);
+                }
+                mix[i] *= gain * *makeup;
+                mix[i + 1] *= gain * *makeup;
+            }
+        }
+        if let Some(ceil) = self.limiter {
+            for s in mix.iter_mut() {
+                *s = ceil * (*s / ceil).tanh();
+            }
+        }
+    }
+}
+
 /// Applies project.master_suite in place over interleaved stereo.
 pub fn apply_master_suite(mix: &mut [f32], suite: &crate::model::MasterSuite, sr: u32) {
     if mix.len() < 4 {
         return;
     }
-
-    if suite.eq_enabled
-        && (suite.eq_low_db.abs() > 0.01
-            || suite.eq_mid_db.abs() > 0.01
-            || suite.eq_high_db.abs() > 0.01)
-    {
-        let mut lx = [
-            Biquad::low_shelf(sr, 120.0, suite.eq_low_db),
-            Biquad::peak(sr, 1200.0, suite.eq_mid_db, 0.9),
-            Biquad::high_shelf(sr, 6500.0, suite.eq_high_db),
-        ];
-        let mut rx = lx;
-        for i in (0..mix.len()).step_by(2) {
-            let (mut l, mut r) = (mix[i], mix[i + 1]);
-            for f in &mut lx {
-                l = f.run(l);
-            }
-            for f in &mut rx {
-                r = f.run(r);
-            }
-            mix[i] = l;
-            mix[i + 1] = r;
-        }
-    }
-
-    if (suite.stereo_width - 1.0).abs() > 0.001 {
-        let w = suite.stereo_width.clamp(0.0, 2.0);
-        for i in (0..mix.len()).step_by(2) {
-            let mid = (mix[i] + mix[i + 1]) * 0.5;
-            let side = (mix[i] - mix[i + 1]) * 0.5 * w;
-            mix[i] = mid + side;
-            mix[i + 1] = mid - side;
-        }
-    }
-
-    if suite.comp_enabled {
-        let threshold = 10f32.powf(suite.comp_threshold_db.clamp(-60.0, 0.0) / 20.0);
-        let ratio = suite.comp_ratio.clamp(1.0, 20.0);
-        let makeup = 10f32.powf(suite.comp_makeup_db.clamp(0.0, 24.0) / 20.0);
-        let (att, rel) = (
-            (-1.0 / (0.004 * sr as f32)).exp(),
-            (-1.0 / (0.09 * sr as f32)).exp(),
-        );
-        let mut env = 0.0f32;
-        for i in (0..mix.len()).step_by(2) {
-            let peak = mix[i].abs().max(mix[i + 1].abs());
-            env = if peak > env {
-                att * env + (1.0 - att) * peak
-            } else {
-                rel * env + (1.0 - rel) * peak
-            };
-            let mut gain = 1.0f32;
-            if env > threshold {
-                let over_db = 20.0 * (env / threshold.max(1e-9)).log10();
-                let gain_db = -over_db * (1.0 - 1.0 / ratio);
-                gain = 10f32.powf(gain_db / 20.0);
-            }
-            mix[i] *= gain * makeup;
-            mix[i + 1] *= gain * makeup;
-        }
-    }
-
-    if suite.limiter_enabled {
-        let ceil = suite.limiter_ceiling.clamp(0.3, 1.0);
-        for s in mix.iter_mut() {
-            *s = ceil * (*s / ceil).tanh();
-        }
-    }
+    MasterSuiteState::new(suite, sr).process(mix);
 }
 
 fn onset_frame(bar: usize, step: usize, step_seconds: f32, swing: u8, sample_rate: u32) -> usize {
@@ -580,7 +629,12 @@ fn synth_one_shot(kind: TrackKind, genre: &str, step: usize, sr: u32) -> Vec<f32
         .collect()
 }
 
-fn trim_and_resample(clip: &SampleClip, reference: &SampleRef, target_rate: u32) -> Vec<f32> {
+fn trim_and_resample(
+    clip: &SampleClip,
+    reference: &SampleRef,
+    target_rate: u32,
+    step_frames: f64,
+) -> Vec<f32> {
     let channels = clip.channels.max(1) as usize;
     let total = clip.frame_count();
     let start = (reference.trim_start.clamp(0.0, 0.99) * total as f32) as usize;
@@ -602,7 +656,22 @@ fn trim_and_resample(clip: &SampleClip, reference: &SampleRef, target_rate: u32)
         let b = mono_frame(clip, next, channels);
         output.push((a + (b - a) * frac) * reference.gain.clamp(0.0, 4.0));
     }
-    output
+    // Varispeed fit: squeeze the take into exactly fit_steps 16ths (0 = natural).
+    let fit = reference.fit_steps.clamp(0, 64) as f64;
+    if fit > 0.0 && !output.is_empty() && step_frames > 0.0 {
+        let target = ((fit * step_frames) as usize).max(1);
+        let mut fitted = Vec::with_capacity(target);
+        for i in 0..target {
+            let pos = i as f64 * output.len() as f64 / target as f64;
+            let base = (pos as usize).min(output.len() - 1);
+            let next = (base + 1).min(output.len() - 1);
+            let frac = (pos.fract()) as f32;
+            fitted.push(output[base] + (output[next] - output[base]) * frac);
+        }
+        fitted
+    } else {
+        output
+    }
 }
 fn mono_frame(clip: &SampleClip, frame: usize, channels: usize) -> f32 {
     let base = frame * channels;
@@ -614,42 +683,70 @@ fn mono_frame(clip: &SampleClip, frame: usize, channels: usize) -> f32 {
     }
 }
 
-fn process_fx(stereo: &mut [f32], fx: &crate::model::FxChain, sr: u32) {
-    let cutoff = fx.lowpass_hz.clamp(40.0, 20_000.0);
-    let alpha = (1.0 - (-TAU * cutoff / sr as f32).exp()).clamp(0.001, 1.0);
-    let delay_len = ((fx.delay_ms.clamp(20.0, 2000.0) / 1000.0 * sr as f32) as usize).max(1);
-    let mut delay = vec![0.0_f32; delay_len * 2];
-    let mut delay_pos = 0;
-    let mut reverb_a = vec![0.0_f32; ((sr as f32 * 0.029).round() as usize).max(1) * 2];
-    let mut reverb_b = vec![0.0_f32; ((sr as f32 * 0.037).round() as usize).max(1) * 2];
-    let mut ra = 0;
-    let mut rb = 0;
-    let mut low = [0.0_f32; 2];
-    let (frames, remainder) = stereo.as_chunks_mut::<2>();
-    debug_assert!(remainder.is_empty());
-    for frame in frames {
-        let input = [frame[0], frame[1]];
-        let mut filtered = [0.0; 2];
-        for ch in 0..2 {
-            low[ch] += alpha * (input[ch] - low[ch]);
-            let driven = (low[ch] * (1.0 + fx.drive * 6.0)).tanh();
-            filtered[ch] = driven;
+/// Per-track FX processor with persistent causal state. Identical per-frame math
+/// to the original monolithic pass — the streaming engine holds one per track.
+struct FxState {
+    fx: crate::model::FxChain,
+    alpha: f32,
+    delay: Vec<f32>,
+    delay_pos: usize,
+    reverb_a: Vec<f32>,
+    reverb_b: Vec<f32>,
+    ra: usize,
+    rb: usize,
+    low: [f32; 2],
+}
+impl FxState {
+    fn new(fx: &crate::model::FxChain, sr: u32) -> Self {
+        let cutoff = fx.lowpass_hz.clamp(40.0, 20_000.0);
+        let alpha = (1.0 - (-TAU * cutoff / sr as f32).exp()).clamp(0.001, 1.0);
+        let delay_len = ((fx.delay_ms.clamp(20.0, 2000.0) / 1000.0 * sr as f32) as usize).max(1);
+        Self {
+            fx: fx.clone(),
+            alpha,
+            delay: vec![0.0_f32; delay_len * 2],
+            delay_pos: 0,
+            reverb_a: vec![0.0_f32; ((sr as f32 * 0.029).round() as usize).max(1) * 2],
+            reverb_b: vec![0.0_f32; ((sr as f32 * 0.037).round() as usize).max(1) * 2],
+            ra: 0,
+            rb: 0,
+            low: [0.0_f32; 2],
         }
-        for ch in 0..2 {
-            let delayed = delay[delay_pos * 2 + ch];
-            let wet_a = reverb_a[ra * 2 + ch];
-            let wet_b = reverb_b[rb * 2 + ch];
-            delay[delay_pos * 2 + ch] = filtered[ch] + delayed * fx.delay_feedback;
-            reverb_a[ra * 2 + ch] = filtered[ch] * 0.28 + wet_a * 0.72;
-            reverb_b[rb * 2 + ch] = filtered[ch] * 0.24 + wet_b * 0.76;
-            frame[ch] = filtered[ch] * (1.0 - fx.delay_mix - fx.reverb_mix * 0.5)
-                + delayed * fx.delay_mix
-                + (wet_a + wet_b) * fx.reverb_mix * 0.5;
-        }
-        delay_pos = (delay_pos + 1) % delay_len;
-        ra = (ra + 1) % reverb_a.len().max(2).div_ceil(2);
-        rb = (rb + 1) % reverb_b.len().max(2).div_ceil(2);
     }
+    fn process(&mut self, stereo: &mut [f32]) {
+        let fx = &self.fx;
+        let alpha = self.alpha;
+        let delay_len = self.delay.len() / 2;
+        let (frames, remainder) = stereo.as_chunks_mut::<2>();
+        debug_assert!(remainder.is_empty());
+        for frame in frames {
+            let input = [frame[0], frame[1]];
+            let mut filtered = [0.0; 2];
+            for ch in 0..2 {
+                self.low[ch] += alpha * (input[ch] - self.low[ch]);
+                let driven = (self.low[ch] * (1.0 + fx.drive * 6.0)).tanh();
+                filtered[ch] = driven;
+            }
+            for ch in 0..2 {
+                let delayed = self.delay[self.delay_pos * 2 + ch];
+                let wet_a = self.reverb_a[self.ra * 2 + ch];
+                let wet_b = self.reverb_b[self.rb * 2 + ch];
+                self.delay[self.delay_pos * 2 + ch] = filtered[ch] + delayed * fx.delay_feedback;
+                self.reverb_a[self.ra * 2 + ch] = filtered[ch] * 0.28 + wet_a * 0.72;
+                self.reverb_b[self.rb * 2 + ch] = filtered[ch] * 0.24 + wet_b * 0.76;
+                frame[ch] = filtered[ch] * (1.0 - fx.delay_mix - fx.reverb_mix * 0.5)
+                    + delayed * fx.delay_mix
+                    + (wet_a + wet_b) * fx.reverb_mix * 0.5;
+            }
+            self.delay_pos = (self.delay_pos + 1) % delay_len;
+            self.ra = (self.ra + 1) % self.reverb_a.len().max(2).div_ceil(2);
+            self.rb = (self.rb + 1) % self.reverb_b.len().max(2).div_ceil(2);
+        }
+    }
+}
+
+fn process_fx(stereo: &mut [f32], fx: &crate::model::FxChain, sr: u32) {
+    FxState::new(fx, sr).process(stereo);
 }
 
 fn automation_value(
@@ -707,6 +804,415 @@ pub fn spawn_render(
         let _ = tx.send(RenderMsg::Done(result));
     });
     (rx, handle)
+}
+
+/* ================= True streaming renderer (phase 2) =================
+   Produces the arrangement bar-by-bar with persistent per-track FX and master
+   states. The reference contract: concatenated chunks == render_core() exactly.
+*/
+
+struct StemStream {
+    fx: FxState,
+    pending: Vec<f32>, // interleaved stereo source overflow into later window
+}
+
+pub struct StreamingRender<'p> {
+    project: &'p Project,
+    sr: u32,
+    bpm: f32,
+    step_seconds: f32,
+    bars: usize,
+    total_frames: usize,
+    bar: usize,
+    next_frame: usize,
+    done: bool,
+    err: Option<String>,
+    included: Vec<usize>,
+    tracks: Vec<StemStream>,
+    suite: MasterSuiteState,
+    sample_cache: HashMap<String, SampleClip>,
+    pattern_map: HashMap<&'p str, &'p Pattern>,
+}
+
+impl<'p> StreamingRender<'p> {
+    pub fn new(project: &'p Project, sample_rate: u32) -> Self {
+        let bpm = project.bpm.clamp(50, 200) as f32;
+        let step_seconds = 60.0 / bpm / 4.0;
+        let bars = project.arrangement.len().max(1);
+        let total_frames =
+            ((bars as f32 * 16.0 * step_seconds + 1.0) * sample_rate as f32).ceil() as usize;
+        let _bar_frames = (16.0 * step_seconds * sample_rate as f32).round().max(1.0) as usize;
+        let any_solo = project.tracks.iter().any(|t| t.solo);
+        let included: Vec<usize> = project
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !(t.mute || (any_solo && !t.solo)))
+            .map(|(i, _)| i)
+            .collect();
+        let tracks = included
+            .iter()
+            .map(|i| StemStream {
+                fx: FxState::new(&project.tracks[*i].fx, sample_rate),
+                pending: Vec::new(),
+            })
+            .collect();
+        Self {
+            project,
+            sr: sample_rate,
+            bpm,
+            step_seconds,
+            bars,
+            total_frames,
+            bar: 0,
+            next_frame: 0,
+            done: false,
+            err: None,
+            included,
+            tracks,
+            suite: MasterSuiteState::new(&project.master_suite, sample_rate),
+            sample_cache: HashMap::new(),
+            pattern_map: project
+                .patterns
+                .iter()
+                .map(|p| (p.id.as_str(), p))
+                .collect(),
+        }
+    }
+
+    pub fn total_frames(&self) -> usize {
+        self.total_frames
+    }
+
+    /// Up to `bar_frames` frames of finished master-chain stereo per chunk.
+    /// None when everything (incl. the 1 s FX tail) has been emitted.
+    pub fn next_chunk(&mut self) -> Option<Vec<f32>> {
+        if self.done || self.err.is_some() {
+            return None;
+        }
+        // Chunk boundaries track the *continuous* time lattice exactly (the same
+        // formula onset_frame uses) — integer-accumulated windows would drift a
+        // few samples per bar and drop hits that fall across the seam.
+        let bar_start =
+            |k: usize| ((k * STEPS) as f32 * self.step_seconds * self.sr as f32) as usize;
+        if self.bar > self.bars {
+            self.done = true;
+            return None;
+        }
+        let start_frame = bar_start(self.bar);
+        if start_frame >= self.total_frames {
+            self.done = true;
+            return None;
+        }
+        let w = if self.bar < self.bars {
+            bar_start(self.bar + 1) - start_frame
+        } else {
+            self.total_frames - start_frame // tail chunk (FX reverb/delay decay)
+        };
+        let mut mix = vec![0.0_f32; w * 2];
+        let bar = self.bar;
+
+        // Per-track: drain pending overflow, add this bar's triggers, run FX.
+        let mut processed: Vec<Vec<f32>> = Vec::with_capacity(self.tracks.len());
+        let available = self.bars.saturating_sub(0); // bars * 16 steps of content
+        let included = self.included.clone();
+        for (track_pos, &track_index) in included.iter().enumerate() {
+            let track = &self.project.tracks[track_index];
+            let mut window = vec![0.0_f32; w * 2];
+            {
+                let stream = &mut self.tracks[track_pos];
+                let take = (stream.pending.len() / 2).min(w);
+                window[..take * 2].copy_from_slice(&stream.pending[..take * 2]);
+                stream.pending.drain(..take * 2);
+            }
+            if bar < available {
+                if let Err(e) =
+                    self.add_bar_sources(track, bar, start_frame, &mut window, track_pos)
+                {
+                    self.err = Some(e);
+                    return None;
+                }
+            }
+            self.tracks[track_pos].fx.process(&mut window);
+            processed.push(window);
+        }
+
+        // Mix with automation — same per-frame math as the offline renderer.
+        for (track_pos, window) in processed.iter().enumerate() {
+            let track = &self.project.tracks[self.included[track_pos]];
+            for f in 0..w {
+                let abs = start_frame + f;
+                let time = abs as f32 / self.sr as f32;
+                let beat = time * self.bpm / 60.0;
+                let auto_volume =
+                    automation_value(self.project, &track.id, AutomationTarget::Volume, beat)
+                        .unwrap_or(1.0);
+                let auto_pan =
+                    automation_value(self.project, &track.id, AutomationTarget::Pan, beat)
+                        .unwrap_or(0.0);
+                let pan = (track.pan + auto_pan).clamp(-1.0, 1.0);
+                let left_gain = ((1.0 - pan) * 0.5).sqrt();
+                let right_gain = ((1.0 + pan) * 0.5).sqrt();
+                let gain = track.volume * auto_volume;
+                let ix = f * 2;
+                mix[ix] += window[ix] * gain * left_gain;
+                mix[ix + 1] += window[ix + 1] * gain * right_gain;
+            }
+        }
+        let master = self.project.master.clamp(0.0, 1.0);
+        let drive = self.project.grit.clamp(0.0, 1.0);
+        for sample in &mut mix {
+            *sample = (*sample * master * (1.0 + drive * 3.0)).tanh();
+        }
+        self.suite.process(&mut mix);
+        self.bar += 1;
+        self.next_frame = start_frame + w;
+        Some(mix)
+    }
+
+    /// Synthesize every trigger belonging to `bar` into `window`, pushing any
+    /// voice content beyond the window into that track's pending stream.
+    fn add_bar_sources(
+        &mut self,
+        track: &crate::model::Track,
+        bar: usize,
+        window_start: usize,
+        window: &mut [f32],
+        track_pos: usize,
+    ) -> std::result::Result<(), String> {
+        let w = window.len() / 2;
+        let Some(slot) = self.project.arrangement.get(bar) else {
+            return Ok(());
+        };
+        let Some(id) = slot.as_ref() else {
+            return Ok(());
+        };
+        let Some(pattern) = self.pattern_map.get(id.as_str()) else {
+            return Ok(());
+        };
+        match track.kind {
+            TrackKind::Kick
+            | TrackKind::Snare
+            | TrackKind::Hat
+            | TrackKind::Cowbell
+            | TrackKind::Sample => {
+                let Some(row) = pattern.rows.get(&track.id) else {
+                    return Ok(());
+                };
+                for step in 0..STEPS {
+                    if !row.get(step).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let start =
+                        onset_frame(bar, step, self.step_seconds, self.project.swing, self.sr);
+                    if track.kind == TrackKind::Sample {
+                        let Some(sample) = track.sample.as_ref() else {
+                            continue;
+                        };
+                        let clip = if let Some(c) = self.sample_cache.get(&sample.path) {
+                            c.clone()
+                        } else {
+                            let decoded = load_wav(&sample.path).map_err(|e| e.to_string())?;
+                            self.sample_cache
+                                .insert(sample.path.clone(), decoded.clone());
+                            decoded
+                        };
+                        let voice = trim_and_resample(
+                            &clip,
+                            sample,
+                            self.sr,
+                            self.step_seconds as f64 * self.sr as f64,
+                        );
+                        if sample.looped {
+                            let next_step = ((step + 1)..STEPS)
+                                .find(|next| row.get(*next).copied().unwrap_or(false))
+                                .unwrap_or(STEPS);
+                            let end = onset_frame(
+                                bar,
+                                next_step,
+                                self.step_seconds,
+                                self.project.swing,
+                                self.sr,
+                            );
+                            add_voice_windowed(
+                                &mut self.tracks[track_pos].pending,
+                                self.total_frames,
+                                window,
+                                window_start,
+                                start,
+                                &voice,
+                                Some(end),
+                                sample.gain,
+                            );
+                        } else {
+                            add_voice_windowed(
+                                &mut self.tracks[track_pos].pending,
+                                self.total_frames,
+                                window,
+                                window_start,
+                                start,
+                                &voice,
+                                None,
+                                sample.gain,
+                            );
+                        }
+                    } else {
+                        let voice =
+                            synth_one_shot(track.kind, pattern.genre.as_str(), step, self.sr);
+                        add_voice_windowed(
+                            &mut self.tracks[track_pos].pending,
+                            self.total_frames,
+                            window,
+                            window_start,
+                            start,
+                            &voice,
+                            None,
+                            1.0,
+                        );
+                    }
+                }
+            }
+            TrackKind::Sub | TrackKind::Bass | TrackKind::Keys => {
+                if let Some(notes) = pattern.notes.get(&track.id) {
+                    for note in notes {
+                        let start = onset_frame(
+                            bar,
+                            note.step as usize,
+                            self.step_seconds,
+                            self.project.swing,
+                            self.sr,
+                        );
+                        let duration = (note.duration as f32 * self.step_seconds).max(0.04);
+                        let voice =
+                            note_voice(track.kind, note.pitch, duration, note.velocity, self.sr);
+                        add_voice_windowed(
+                            &mut self.tracks[track_pos].pending,
+                            self.total_frames,
+                            window,
+                            window_start,
+                            start,
+                            &voice,
+                            None,
+                            1.0,
+                        );
+                    }
+                }
+            }
+        }
+        let _ = w;
+        Ok(())
+    }
+}
+
+/// Add a mono voice into this window; content beyond the window end is routed
+/// into `pending` (same per-frame addition order as the offline build).
+/// When `loop_end` is Some, the voice repeats from 0 until that absolute frame
+/// (bar-local looped samples, mirroring add_looped_voice).
+#[allow(clippy::too_many_arguments)]
+fn add_voice_windowed(
+    pending: &mut Vec<f32>,
+    total_frames: usize,
+    window: &mut [f32],
+    window_start: usize,
+    start_abs: usize,
+    mono: &[f32],
+    loop_end: Option<usize>,
+    gain: f32,
+) {
+    let w = window.len() / 2;
+    if start_abs < window_start {
+        return;
+    }
+    let rel = start_abs - window_start;
+    match loop_end {
+        None => {
+            for (i, sample) in mono.iter().enumerate() {
+                let frame = rel + i;
+                if frame >= total_frames {
+                    break;
+                }
+                let v = *sample * gain;
+                if frame < w {
+                    window[frame * 2] += v;
+                    window[frame * 2 + 1] += v;
+                } else {
+                    let over = (frame - w) * 2;
+                    if pending.len() < over + 2 {
+                        pending.resize(over + 2, 0.0);
+                    }
+                    pending[over] += v;
+                    pending[over + 1] += v;
+                }
+            }
+        }
+        Some(end_abs) => {
+            if mono.is_empty() {
+                return;
+            }
+            let end_rel = end_abs.saturating_sub(window_start);
+            let mut cursor = rel;
+            while cursor < end_rel {
+                let count = (end_rel - cursor).min(mono.len());
+                for (offset, sample) in mono[..count].iter().enumerate() {
+                    let frame = cursor + offset;
+                    if frame >= total_frames {
+                        return;
+                    }
+                    let v = *sample * gain;
+                    if frame < w {
+                        window[frame * 2] += v;
+                        window[frame * 2 + 1] += v;
+                    } else {
+                        let over = (frame - w) * 2;
+                        if pending.len() < over + 2 {
+                            pending.resize(over + 2, 0.0);
+                        }
+                        pending[over] += v;
+                        pending[over + 1] += v;
+                    }
+                }
+                cursor += count;
+            }
+        }
+    }
+}
+
+/// Background streaming producer: renders just-ahead chunks into a ring while
+/// reporting progress. Memory stays flat regardless of arrangement length.
+pub fn spawn_stream(
+    project: Project,
+    sample_rate: u32,
+) -> (
+    std::sync::mpsc::Receiver<RenderMsg>,
+    rtrb::Consumer<f32>,
+    usize,
+    std::thread::JoinHandle<()>,
+) {
+    let ring_capacity = 1 << 18; // ~2.97 s of stereo at 44.1 kHz look-ahead
+    let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(ring_capacity);
+    let total = StreamingRender::new(&project, sample_rate).total_frames();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let bars = project.arrangement.len().max(1) + 1; // bars + final tail chunk
+    let handle = std::thread::spawn(move || {
+        let mut engine = StreamingRender::new(&project, sample_rate);
+        let mut sent_bars = 0usize;
+        while let Some(chunk) = engine.next_chunk() {
+            let mut offset = 0usize;
+            while offset < chunk.len() {
+                match producer.push(chunk[offset]) {
+                    Ok(()) => offset += 1,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                }
+            }
+            sent_bars += 1;
+            let _ = tx.send(RenderMsg::Progress {
+                bar: sent_bars,
+                bars,
+            });
+        }
+        let _ = tx.send(RenderMsg::Done(Ok(Vec::new())));
+    });
+    (rx, consumer, total, handle)
 }
 
 #[cfg(test)]
@@ -912,6 +1418,68 @@ mod mastering_tests {
             "progress not monotonic"
         );
         assert!(marks.iter().all(|m| (0.0..=1.0).contains(m)));
+    }
+
+    #[test]
+    fn streaming_render_is_bit_identical_to_offline_core() {
+        // THE streaming correctness contract, proven across every studio floor
+        // and every arrangement prefix: chunk concatenation == whole render,
+        // sample for sample. Covers drum rows, pitched lanes, loops, tails.
+        for studio in ["iftar", "drift", "boogie", "rhythm"] {
+            let full = default_project(studio);
+            let full_ref = render_core(&full, 44_100).unwrap();
+            for keep in 1..=full.arrangement.len() {
+                let mut project = full.clone();
+                project.arrangement.truncate(keep);
+                let reference = render_core(&project, 44_100).unwrap();
+                let mut engine = StreamingRender::new(&project, 44_100);
+                let mut streamed = Vec::new();
+                while let Some(chunk) = engine.next_chunk() {
+                    streamed.extend_from_slice(&chunk);
+                }
+                assert_eq!(engine.err, None, "{studio}/{keep}: stream error");
+                assert_eq!(
+                    streamed.len(),
+                    reference.len(),
+                    "{studio}/{keep}: streamed length diverged"
+                );
+                assert_eq!(streamed, reference, "{studio}/{keep}: NOT bit-identical");
+            }
+            // determinism cross-checks on the same instance
+            assert_eq!(
+                render_core(&full, 44_100).unwrap(),
+                full_ref,
+                "{studio}: core not deterministic"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_fit_steps_warps_length_to_grid() {
+        let clip = SampleClip {
+            sample_rate: 44_100,
+            channels: 1,
+            frames: vec![0.5; 8_820],
+        }; // 0.2 s
+        let mut reference = crate::model::SampleRef::new("/tmp/x.wav".into());
+        reference.gain = 1.0;
+        reference.fit_steps = 2;
+        let step_seconds = 60.0 / 120.0 / 4.0; // 0.125 s
+        let step_frames = step_seconds * 44_100.0; // 5512.5
+        let voice = trim_and_resample(&clip, &reference, 44_100, step_frames);
+        let expect = (2.0 * step_frames) as usize;
+        assert_eq!(
+            voice.len(),
+            expect,
+            "fit_steps did not match the grid exactly"
+        );
+        reference.fit_steps = 0;
+        let natural = trim_and_resample(&clip, &reference, 44_100, step_frames);
+        assert_eq!(
+            natural.len(),
+            8_820,
+            "fit_steps=0 must leave the take untouched"
+        );
     }
 
     #[test]

@@ -62,6 +62,10 @@ pub struct SampleRef {
     pub trim_end: f32,
     pub gain: f32,
     pub looped: bool,
+    /// Varispeed "warp": squeeze this take into exactly `fit_steps` 16ths
+    /// (0 = natural length). MPC-style length fit — pitch follows speed.
+    #[serde(default)]
+    pub fit_steps: u8,
 }
 impl SampleRef {
     pub fn new(path: String) -> Self {
@@ -69,6 +73,7 @@ impl SampleRef {
             path,
             trim_start: 0.0,
             trim_end: 1.0,
+            fit_steps: 0,
             gain: 1.0,
             looped: false,
         }

@@ -775,6 +775,18 @@ impl BeatCraftApp {
                                                 {
                                                     actions.changed = true;
                                                 }
+                                                ui.label(RichText::new("Fit").small().color(color("#8792A2")));
+                                                if ui
+                                                    .add(
+                                                        egui::DragValue::new(&mut sample.fit_steps)
+                                                            .range(0..=64)
+                                                            .speed(1),
+                                                    )
+                                                    .on_hover_text("Varispeed warp: force the take to exactly N 16ths (0 = natural)")
+                                                    .changed()
+                                                {
+                                                    actions.changed = true;
+                                                }
                                             } else {
                                                 ui.label(
                                                     RichText::new("No WAV assigned")
@@ -1116,7 +1128,10 @@ impl BeatCraftApp {
             self.render_progress = None;
             match result {
                 Ok(buffer) => {
-                    if let Some(engine) = &self.engine {
+                    if buffer.is_empty() {
+                        // streaming mode: audio already flowed through the ring
+                        self.status = "Stream render finished — tail playing out".into();
+                    } else if let Some(engine) = &self.engine {
                         engine.play(buffer);
                         self.paused = false;
                         self.status = "Playing rendered arrangement".into();
@@ -1241,10 +1256,15 @@ impl BeatCraftApp {
         } else if let Some(project) = &self.project {
             // Streaming pipeline: bounce on a worker thread; the UI (transport,
             // MIDI-in, mixer) stays fully live while audio is being produced.
-            let (rx, _handle) = audio::spawn_render(project.clone(), engine.sample_rate());
+            // True streaming: the render thread stays just ahead of the playhead;
+            // playback starts with the first bar, memory stays flat forever.
+            let (rx, consumer, total, _handle) =
+                audio::spawn_stream(project.clone(), engine.sample_rate());
+            engine.play_stream(consumer, total);
+            self.paused = false;
             self.pending_render = Some(rx);
-            self.render_progress = Some((0, project.arrangement.len().max(1)));
-            self.status = "Rendering on background thread — playback starts automatically".into();
+            self.render_progress = Some((0, project.arrangement.len().max(1) + 1));
+            self.status = "Streaming playback — rendering just ahead of the playhead".into();
         }
     }
     fn toggle_recording(&mut self) {
