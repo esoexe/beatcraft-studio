@@ -121,7 +121,7 @@ pub fn export_midi(project: &Project, path: impl AsRef<Path>) -> Result<usize> {
                             event_count += 2;
                         }
                     }
-                    TrackKind::Sub | TrackKind::Bass | TrackKind::Keys => {
+                    TrackKind::Sub | TrackKind::Bass | TrackKind::Keys | TrackKind::Plugin => {
                         if let Some(notes) = pattern.notes.get(&track.id) {
                             for note in notes.iter().filter(|n| n.step as usize == step) {
                                 let vel = (note.velocity as f32 * track.volume)

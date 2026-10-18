@@ -82,6 +82,8 @@ pub struct BeatCraftApp {
     autosave_written: Option<PathBuf>,
     /// CLAP effects found on the system (scanned on first open of the mixer).
     clap_effects: Option<std::rc::Rc<Vec<(PathBuf, crate::clap::PluginInfo)>>>,
+    /// CLAP instruments found on the system (scanned on first "add plugin track").
+    clap_instruments: Option<std::rc::Rc<Vec<(PathBuf, crate::clap::PluginInfo)>>>,
 }
 
 impl BeatCraftApp {
@@ -144,6 +146,7 @@ impl BeatCraftApp {
             piano_roll_scroll_initialized: false,
             selected_note: None,
             clap_effects: None,
+            clap_instruments: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_autosave: std::time::Instant::now(),
@@ -515,7 +518,7 @@ impl BeatCraftApp {
             panel_frame(ui,|ui|{
                 ui.horizontal(|ui|{
                     ui.label(RichText::new("PIANO ROLL").small().strong().color(color("#9AA5B5")));
-                    egui::ComboBox::from_id_salt("piano-track").selected_text(track_name(project,&self.selected_track)).show_ui(ui,|ui|{for track in project.tracks.iter().filter(|t|matches!(t.kind,TrackKind::Sub|TrackKind::Bass|TrackKind::Keys)){ui.selectable_value(&mut self.selected_track,track.id.clone(),&track.name);}});
+                    egui::ComboBox::from_id_salt("piano-track").selected_text(track_name(project,&self.selected_track)).show_ui(ui,|ui|{for track in project.tracks.iter().filter(|t|matches!(t.kind,TrackKind::Sub|TrackKind::Bass|TrackKind::Keys|TrackKind::Plugin)){ui.selectable_value(&mut self.selected_track,track.id.clone(),&track.name);}});
                     ui.label(RichText::new("New note length").color(color("#E5E8E0")));ui.add(egui::DragValue::new(&mut self.note_length).range(1..=16).suffix(" steps"));
                     ui.label(RichText::new("Velocity").color(color("#E5E8E0")));ui.add(egui::Slider::new(&mut self.note_velocity,1..=127).show_value(true));
                     if ui.button("Clear track notes").clicked() {
@@ -655,6 +658,46 @@ impl BeatCraftApp {
                                 actions.new_sample_track = true;
                                 actions.changed = true;
                             }
+                            ui.menu_button("+ Add plugin track", |ui| {
+                                if self.clap_instruments.is_none() {
+                                    self.clap_instruments = Some(std::rc::Rc::new(crate::clap::scan_instruments()));
+                                }
+                                let instruments = self.clap_instruments.clone().unwrap_or_default();
+                                if instruments.is_empty() {
+                                    ui.label(RichText::new("No CLAP instruments found on this system").small().color(color("#8792A2")));
+                                }
+                                for (path, info) in instruments.iter() {
+                                    let label = if info.vendor.is_empty() { info.name.clone() } else { format!("{} — {}", info.name, info.vendor) };
+                                    if ui.button(label).clicked() {
+                                        let n = project.tracks.iter().filter(|t| t.kind == TrackKind::Plugin).count() + 1;
+                                        let id = format!("plugin-{n}");
+                                        project.tracks.push(Track {
+                                            id: id.clone(),
+                                            name: info.name.clone(),
+                                            kind: TrackKind::Plugin,
+                                            color: "#B48CFF".into(),
+                                            volume: 0.82,
+                                            pan: 0.0,
+                                            mute: false,
+                                            solo: false,
+                                            fx: FxChain::default(),
+                                            sample: None,
+                                            clap_instrument: Some(crate::model::ClapInsert {
+                                                path: path.to_string_lossy().to_string(),
+                                                plugin_id: info.id.clone(),
+                                                name: info.name.clone(),
+                                                enabled: true,
+                                            }),
+                                        });
+                                        for pat in &mut project.patterns {
+                                            pat.notes.entry(id.clone()).or_default();
+                                        }
+                                        self.selected_track = id;
+                                        actions.changed = true;
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
                             ui.label(
                             RichText::new(
                                 "Per-track level, pan, mute/solo, filter, drive, delay, and reverb",
@@ -1087,6 +1130,7 @@ impl BeatCraftApp {
                     solo: false,
                     fx: FxChain::default(),
                     sample: Some(SampleRef::new(path.to_string_lossy().into_owned())),
+                    clap_instrument: None,
                 };
                 for pattern in &mut project.patterns {
                     pattern.rows.insert(id.clone(), vec![false; STEPS]);
@@ -1365,6 +1409,7 @@ impl BeatCraftApp {
                 solo: false,
                 fx: FxChain::default(),
                 sample: Some(SampleRef::new(path.to_string_lossy().into_owned())),
+                clap_instrument: None,
             };
             for p in &mut project.patterns {
                 p.rows.insert(id.clone(), vec![false; STEPS]);

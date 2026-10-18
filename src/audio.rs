@@ -161,6 +161,9 @@ fn render_core_impl(
         .collect();
     let any_solo = project.tracks.iter().any(|t| t.solo);
     let mut sample_cache: HashMap<String, SampleClip> = HashMap::new();
+    // Plugin tracks: absolute-frame note events collected during the bar loop,
+    // rendered in one continuous pass afterwards (see below).
+    let mut plugin_events: HashMap<usize, Vec<crate::clap::NoteEvent>> = HashMap::new();
 
     for (bar, slot) in project.arrangement.iter().enumerate() {
         if let Some(cb) = progress.as_deref_mut() {
@@ -273,7 +276,66 @@ fn render_core_impl(
                         }
                     }
                 }
+                TrackKind::Plugin => {
+                    if let Some(notes) = pattern.notes.get(&track.id) {
+                        let evs = plugin_events.entry(track_index).or_default();
+                        for note in notes {
+                            let on = onset_frame(
+                                bar,
+                                note.step as usize,
+                                step_seconds,
+                                project.swing,
+                                sample_rate,
+                            );
+                            let off_step = note.step as usize + note.duration.max(1) as usize;
+                            let off = onset_frame(
+                                bar,
+                                off_step,
+                                step_seconds,
+                                project.swing,
+                                sample_rate,
+                            );
+                            let key = note.pitch.min(127);
+                            evs.push(crate::clap::NoteEvent {
+                                abs_frame: on,
+                                on: true,
+                                key,
+                                velocity: note.velocity as f32 / 127.0,
+                            });
+                            evs.push(crate::clap::NoteEvent {
+                                abs_frame: off,
+                                on: false,
+                                key,
+                                velocity: 0.0,
+                            });
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    // CLAP instruments: one continuous pass per track after the source loop
+    // and before per-track FX. The persistent instance plus absolute event
+    // filtering make this tile-identical to the streaming engine.
+    for (track_index, track) in project.tracks.iter().enumerate() {
+        if track.kind != TrackKind::Plugin {
+            continue;
+        }
+        if track.mute || (any_solo && !track.solo) {
+            continue;
+        }
+        let Some(insert) = track.clap_instrument.as_ref().filter(|i| i.enabled) else {
+            continue;
+        };
+        let events = plugin_events.get(&track_index).cloned().unwrap_or_default();
+        match crate::clap::ClapSynth::load(
+            std::path::Path::new(&insert.path),
+            &insert.plugin_id,
+            sample_rate,
+        ) {
+            Ok(mut synth) => synth.render_window(&mut stems[track_index], 0, &events),
+            Err(e) => eprintln!("CLAP instrument '{}' skipped: {e}", insert.name),
         }
     }
 
@@ -853,6 +915,8 @@ pub struct StreamingRender<'p> {
     /// Persistent master CLAP instance; tiled on the global 512-frame grid so
     /// chunked output stays bit-identical to the single-shot offline renderer.
     master_fx: Option<crate::clap::ClapFx>,
+    /// Per-track CLAP instruments (same index order as `tracks`/`included`).
+    synths: Vec<Option<crate::clap::ClapSynth>>,
     sample_cache: HashMap<String, SampleClip>,
     pattern_map: HashMap<&'p str, &'p Pattern>,
 }
@@ -880,6 +944,28 @@ impl<'p> StreamingRender<'p> {
                 pending: Vec::new(),
             })
             .collect();
+        // CLAP instruments come online once and stream across the whole bounce.
+        let synths = included
+            .iter()
+            .map(|&ti| {
+                let track = &project.tracks[ti];
+                if track.kind != TrackKind::Plugin {
+                    return None;
+                }
+                let insert = track.clap_instrument.as_ref().filter(|i| i.enabled)?;
+                match crate::clap::ClapSynth::load(
+                    std::path::Path::new(&insert.path),
+                    &insert.plugin_id,
+                    sample_rate,
+                ) {
+                    Ok(synth) => Some(synth),
+                    Err(e) => {
+                        eprintln!("CLAP instrument '{}' skipped: {e}", insert.name);
+                        None
+                    }
+                }
+            })
+            .collect();
         Self {
             project,
             sr: sample_rate,
@@ -895,6 +981,7 @@ impl<'p> StreamingRender<'p> {
             tracks,
             suite: MasterSuiteState::new(&project.master_suite, sample_rate),
             master_fx: master_fx_instance(project, sample_rate),
+            synths,
             sample_cache: HashMap::new(),
             pattern_map: project
                 .patterns
@@ -957,6 +1044,12 @@ impl<'p> StreamingRender<'p> {
                     return None;
                 }
             }
+            if self.synths[track_pos].is_some() {
+                let events = self.collect_synth_events(track_index, start_frame, start_frame + w);
+                if let Some(synth) = self.synths[track_pos].as_mut() {
+                    synth.render_window(&mut window, start_frame, &events);
+                }
+            }
             self.tracks[track_pos].fx.process(&mut window);
             processed.push(window);
         }
@@ -995,6 +1088,74 @@ impl<'p> StreamingRender<'p> {
         self.bar += 1;
         self.next_frame = start_frame + w;
         Some(mix)
+    }
+
+    /// Absolute-frame note events for a plugin track inside `[start, end)`.
+    /// NOTE_ONs that began before the window were already delivered to the
+    /// persistent instance by earlier chunks, so only events *landing* in the
+    /// window are emitted — exactly what the offline renderer delivers in its
+    /// single continuous pass.
+    fn collect_synth_events(
+        &self,
+        track_index: usize,
+        start: usize,
+        end: usize,
+    ) -> Vec<crate::clap::NoteEvent> {
+        let track = &self.project.tracks[track_index];
+        let bar_start =
+            |k: usize| ((k * STEPS) as f32 * self.step_seconds * self.sr as f32) as usize;
+        let mut evs = Vec::new();
+        for (bar, slot) in self.project.arrangement.iter().enumerate() {
+            if bar_start(bar) >= end {
+                break; // nothing past this bar can start inside the window
+            }
+            let Some(id) = slot.as_ref() else {
+                continue;
+            };
+            let Some(pattern) = self.pattern_map.get(id.as_str()) else {
+                continue;
+            };
+            let Some(notes) = pattern.notes.get(&track.id) else {
+                continue;
+            };
+            for note in notes {
+                let on = onset_frame(
+                    bar,
+                    note.step as usize,
+                    self.step_seconds,
+                    self.project.swing,
+                    self.sr,
+                );
+                if on >= end {
+                    continue;
+                }
+                let off = onset_frame(
+                    bar,
+                    note.step as usize + note.duration.max(1) as usize,
+                    self.step_seconds,
+                    self.project.swing,
+                    self.sr,
+                );
+                let key = note.pitch.min(127);
+                if on >= start {
+                    evs.push(crate::clap::NoteEvent {
+                        abs_frame: on,
+                        on: true,
+                        key,
+                        velocity: note.velocity as f32 / 127.0,
+                    });
+                }
+                if off >= start && off < end {
+                    evs.push(crate::clap::NoteEvent {
+                        abs_frame: off,
+                        on: false,
+                        key,
+                        velocity: 0.0,
+                    });
+                }
+            }
+        }
+        evs
     }
 
     /// Synthesize every trigger belonging to `bar` into `window`, pushing any
@@ -1098,6 +1259,11 @@ impl<'p> StreamingRender<'p> {
                         );
                     }
                 }
+            }
+            TrackKind::Plugin => {
+                // Events are delivered straight into next_chunk's persistent
+                // ClapSynth instances (see collect_synth_events); nothing is
+                // synthesized here.
             }
             TrackKind::Sub | TrackKind::Bass | TrackKind::Keys => {
                 if let Some(notes) = pattern.notes.get(&track.id) {

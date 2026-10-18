@@ -2,6 +2,38 @@
 
 All notable changes to BeatCraft Studio are documented here.
 
+## [2.6.0] — 2026-10-18
+
+### Added — CLAP instruments
+
+- **Instrument tracks.** "+ Add plugin track" in the mixer enumerates every
+  CLAP `instrument` on your system (same spec scan paths as the FX host) and
+  adds it as a purple track driven by a pitched lane: notes from the tracker /
+  piano roll / MIDI-in play the plugin. Swing, velocity (mapped from 0-127 to
+  the spec's 0..1), and sample-accurate gates all carry through.
+- **Sample-accurate, streaming-true note delivery.** Notes become
+  `clap_event_note` NOTE_ON/OFF pairs pinned to the absolute frame timeline;
+  the streaming engine keeps one persistent instance per track and only emits
+  events *landing* in each chunk, so a note that opens in bar 1 and closes in
+  bar 5 plays exactly once. Both render paths tile onto the same global
+  512-frame grid and see identical `steady_time`/`process()` call sequences —
+  offline and streamed bounces remain bit-identical with instruments active
+  (proven against an in-process instrument fixture: event offsets exact to the
+  sample, whole-timeline vs. four-window renders bit-equal). 26/26 tests.
+- Instrument output flows through the track's normal chain afterwards
+  (transient/drive/delay/reverb sends, mixer volume/pan/automation, mute/solo),
+  and MIDI file export includes plugin notes as pitched events.
+- Loading validates the note-port dialect (CLAP) and fails loudly with a
+  dry-render fallback on machines lacking the plugin — same no-fail guarantee
+  as the FX insert.
+
+### Not yet (honesty ledger)
+
+- Still headless: no plugin GUI, no parameter automation.
+- No note expressions / MPE, no tempo or transport events, no MIDI-dialect
+  bridging — CLAP-dialect instruments only.
+- Plugin latency (PDC) and sidechain routing remain on the list.
+
 ## [2.5.0] — 2026-10-18
 
 ### Added — The Plugin Host release

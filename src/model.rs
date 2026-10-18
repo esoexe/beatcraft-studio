@@ -16,6 +16,8 @@ pub enum TrackKind {
     Bass,
     Keys,
     Sample,
+    /// A CLAP instrument played by the pattern's note lane.
+    Plugin,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,6 +32,9 @@ pub struct Track {
     pub solo: bool,
     pub fx: FxChain,
     pub sample: Option<SampleRef>,
+    /// CLAP instrument backing a TrackKind::Plugin track.
+    #[serde(default)]
+    pub clap_instrument: Option<ClapInsert>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -256,6 +261,7 @@ fn track(id: &str, name: &str, kind: TrackKind, color: &str) -> Track {
         solo: false,
         fx: FxChain::default(),
         sample: None,
+        clap_instrument: None,
     }
 }
 pub fn standard_tracks() -> Vec<Track> {

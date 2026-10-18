@@ -32,6 +32,10 @@ The launcher uses subtle animated accent borders. During playback, a moving sequ
   all editable with undo/redo everywhere.
 - **Full mixer** — per-track volume, pan, mute/solo, transient shaper, drive,
   chorus/delay send FX.
+- **CLAP instruments** *(new in 2.6)* — "+ Add plugin track" turns any CLAP
+  **instrument** on your system into a purple track played by the tracker,
+  piano roll, or MIDI-in; sample-accurate note gates, persistent instances, and
+  the same streamed = offline bit-parity guarantee as everything else.
 - **CLAP plugin hosting** *(new in 2.5)* — insert any CLAP **audio effect**
   found on your system at the end of the master chain (reverbs, saturators,
   stereo tools…). Spec-compliant scan paths incl. `CLAP_PATH`, persistent
