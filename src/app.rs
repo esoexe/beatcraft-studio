@@ -70,6 +70,14 @@ pub struct BeatCraftApp {
     redo_stack: Vec<Project>,
     last_autosave: std::time::Instant,
     dirty_since_save: bool,
+    /// Background render in flight (streaming pipeline stage 1): UI never blocks.
+    pending_render: Option<std::sync::mpsc::Receiver<audio::RenderMsg>>,
+    render_progress: Option<(usize, usize)>,
+    /// Hardware MIDI-in: active connection, playhead-quantized recording arm.
+    midi_session: Option<crate::midi::MidiInputSession>,
+    midi_armed: bool,
+    midi_session_ping: Option<String>,
+    last_midi_write: std::time::Instant,
     recovery_offer: Option<PathBuf>,
     autosave_written: Option<PathBuf>,
 }
@@ -137,6 +145,12 @@ impl BeatCraftApp {
             redo_stack: Vec::new(),
             last_autosave: std::time::Instant::now(),
             dirty_since_save: false,
+            pending_render: None,
+            render_progress: None,
+            midi_session: None,
+            midi_armed: false,
+            midi_session_ping: None,
+            last_midi_write: std::time::Instant::now(),
             recovery_offer: None,
             autosave_written: None,
         };
@@ -366,6 +380,45 @@ impl BeatCraftApp {
                 if ui.button("Stop").clicked(){actions.stop=true;}
                 if self.recorder.is_some(){if ui.button(RichText::new("Stop recording").color(color("#F08D79"))).clicked(){actions.record=true;}}
                 else if ui.button("Record input").on_hover_text("Record from the default audio input, then add the take as a sample track").clicked(){actions.record=true;}
+                ui.separator();
+                let midi_label = self.midi_session.as_ref().map(|m| format!("MIDI-in: {}", m.device_name)).unwrap_or_else(|| "MIDI in".to_string());
+                ui.menu_button(midi_label, |ui| {
+                    ui.set_min_width(230.0);
+                    let devices = crate::midi::list_input_devices();
+                    if devices.is_empty() {
+                        ui.label(RichText::new("No MIDI inputs detected — plug in a keyboard/controller.").small().color(color("#8792A2")));
+                    }
+                    for name in devices {
+                        if ui.button(&name).clicked() {
+                            match crate::midi::connect_input(&name) {
+                                Some(session) => {
+                                    self.status = format!("MIDI-in connected: {}", session.device_name);
+                                    self.midi_session = Some(session);
+                                }
+                                None => self.status = "Could not open that MIDI input.".into(),
+                            }
+                        }
+                    }
+                    if self.midi_session.is_some() && ui.button("Disconnect").clicked() {
+                        self.midi_session = None;
+                        self.status = "MIDI-in disconnected".into();
+                    }
+                    ui.label(RichText::new("Arm MIDI REC below, press Play, and play your controller — notes quantize onto the selected pattern.").small().color(color("#8792A2")));
+                });
+                if self.midi_session.is_some() {
+                    let armed_color = color(if self.midi_armed { "#F0625D" } else { "#7A8494" });
+                    if ui.button(RichText::new(if self.midi_armed { "● MIDI REC" } else { "○ MIDI REC" }).color(armed_color))
+                        .on_hover_text("Arm hardware-MIDI recording: while playing, controller notes land on the grid at the playhead")
+                        .clicked()
+                    {
+                        self.midi_armed = !self.midi_armed;
+                        self.status = if self.midi_armed {
+                            "MIDI REC armed — press Play and perform".into()
+                        } else {
+                            "MIDI REC disarmed".into()
+                        };
+                    }
+                }
                 ui.separator();
                 ui.label(RichText::new("TEMPO").small().strong().color(color("#9AA5B5")));
                 let mut tempo=project.bpm as i32;
@@ -1039,6 +1092,136 @@ impl BeatCraftApp {
             Err(e) => self.status = format!("MIDI export failed: {e}"),
         }
     }
+    /// Drain the background render: show progress live, hand off when complete.
+    fn service_pending_render(&mut self) {
+        let Some(rx) = &self.pending_render else {
+            return;
+        };
+        let mut done = None;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                audio::RenderMsg::Progress { bar, bars } => {
+                    self.render_progress = Some((bar, bars));
+                }
+                audio::RenderMsg::Done(result) => done = Some(result),
+            }
+        }
+        if let Some((bar, bars)) = self.render_progress {
+            if done.is_none() {
+                self.status = format!("Rendering bar {}/{bars} on background thread…", bar + 1);
+            }
+        }
+        if let Some(result) = done {
+            self.pending_render = None;
+            self.render_progress = None;
+            match result {
+                Ok(buffer) => {
+                    if let Some(engine) = &self.engine {
+                        engine.play(buffer);
+                        self.paused = false;
+                        self.status = "Playing rendered arrangement".into();
+                    }
+                }
+                Err(e) => self.status = format!("Playback render failed: {e}"),
+            }
+        }
+    }
+
+    /// Consume hardware controller events from MIDI-in. When armed and playing,
+    /// notes are quantized onto the selected pattern's 16-step grid at the
+    /// playhead (GM mapping on drum floors, pitched notes on Drift/Boogie).
+    fn service_midi_in(&mut self) {
+        let Some(session) = &self.midi_session else {
+            return;
+        };
+        let mut events = Vec::new();
+        while let Ok((_at, event)) = session.rx.try_recv() {
+            events.push(event);
+        }
+        if !events.is_empty() {
+            if let Some(session) = &self.midi_session {
+                self.midi_session_ping = Some(session.device_name.clone());
+            }
+        }
+        for event in events {
+            if let crate::midi::LiveMidiEvent::NoteOn {
+                pitch, velocity, ..
+            } = event
+            {
+                self.handle_midi_note_on(pitch, velocity);
+            }
+        }
+    }
+
+    fn handle_midi_note_on(&mut self, pitch: u8, velocity: u8) {
+        let name = midi_note_name(pitch);
+        let armed = self.midi_armed;
+        let playing = self.engine.as_ref().is_some_and(AudioEngine::is_playing);
+        if !armed || !playing {
+            self.status = format!(
+                "MIDI-in ♪ {name} (vel {velocity}) — arm MIDI REC and press play to record it to the grid"
+            );
+            return;
+        }
+        let (engine_rate, frames) = match &self.engine {
+            Some(e) => (e.sample_rate() as f32, e.position_frames()),
+            None => return,
+        };
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let step_seconds = 60.0 / (project.bpm.clamp(50, 200) as f32) / 4.0;
+        let frames_per_step = (step_seconds * engine_rate).max(1.0);
+        let step = ((frames as f32 / frames_per_step).round() as u16) % STEPS as u16;
+        // throttle undo spam: one undo snapshot per ~500 ms of performance
+        if self.last_midi_write.elapsed() > std::time::Duration::from_millis(500) {
+            self.push_undo(project.clone());
+        }
+        self.last_midi_write = std::time::Instant::now();
+        // chosen lane decided before we borrow the project mutably
+        let preferred_lane = self.selected_note.as_ref().map(|(lane, _, _)| lane.clone());
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        let Some(pattern) = project.selected_pattern_mut() else {
+            return;
+        };
+        if pattern.rows.is_empty() {
+            // Pitched floor: insert a grid note in the current lane.
+            let lane = preferred_lane
+                .or_else(|| pattern.notes.keys().next().cloned())
+                .unwrap_or_else(|| "keys".to_string());
+            let velocity = velocity.max(1);
+            pattern
+                .notes
+                .entry(lane.clone())
+                .or_default()
+                .push(model::Note {
+                    step,
+                    pitch,
+                    duration: 1,
+                    velocity,
+                });
+            self.dirty_since_save = true;
+            self.status = format!("MIDI REC ♪ {name} → {lane} · step {}", step + 1);
+        } else {
+            // Drum floor: GM row mapping, set the step hot.
+            let row = crate::midi::drum_row_for_pitch(pitch).to_string();
+            let row = if pattern.rows.contains_key(&row) {
+                row
+            } else {
+                pattern.rows.keys().next().cloned().unwrap_or_default()
+            };
+            if let Some(steps) = pattern.rows.get_mut(&row) {
+                if let Some(cell) = steps.get_mut(step as usize) {
+                    *cell = true;
+                }
+            }
+            self.dirty_since_save = true;
+            self.status = format!("MIDI REC ♪ {name} → {row} · step {}", step + 1);
+        }
+    }
+
     fn toggle_playback(&mut self) {
         let Some(engine) = &self.engine else {
             self.status = self
@@ -1056,14 +1239,12 @@ impl BeatCraftApp {
             self.paused = false;
             self.status = "Playback resumed".into();
         } else if let Some(project) = &self.project {
-            match audio::render(project, engine.sample_rate()) {
-                Ok(buffer) => {
-                    engine.play(buffer);
-                    self.paused = false;
-                    self.status = "Playing rendered arrangement".into();
-                }
-                Err(e) => self.status = format!("Playback render failed: {e}"),
-            }
+            // Streaming pipeline: bounce on a worker thread; the UI (transport,
+            // MIDI-in, mixer) stays fully live while audio is being produced.
+            let (rx, _handle) = audio::spawn_render(project.clone(), engine.sample_rate());
+            self.pending_render = Some(rx);
+            self.render_progress = Some((0, project.arrangement.len().max(1)));
+            self.status = "Rendering on background thread — playback starts automatically".into();
         }
     }
     fn toggle_recording(&mut self) {
@@ -1244,6 +1425,8 @@ impl eframe::App for BeatCraftApp {
             self.push_undo(before);
         }
         self.perform_actions(actions);
+        self.service_pending_render();
+        self.service_midi_in();
     }
 }
 
@@ -1406,6 +1589,14 @@ fn toggle_step(project: &mut Project, track_id: &str, step: usize) {
         }
     }
 }
+fn midi_note_name(pitch: u8) -> String {
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    let note = NAMES[(pitch % 12) as usize];
+    format!("{note}{}", pitch as i32 / 12 - 1)
+}
+
 fn draw_step_grid(
     ui: &mut egui::Ui,
     project: &mut Project,

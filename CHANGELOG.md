@@ -2,6 +2,28 @@
 
 All notable changes to BeatCraft Studio are documented here.
 
+## [1.2.0] — 2026-10-18
+
+### Added — Realtime & Performance pass
+
+- **Hardware MIDI-in** (`midir`, all desktop OSes) — pick any connected
+  keyboard/controller from the transport "MIDI in" menu, arm **MIDI REC**, press
+  Play: note-ons are quantized onto the selected pattern's 16-step grid at the
+  playhead. GM-mapped rows on drum floors (kick 35/36, snare 38–40, hats 42/44/46,
+  cowbell/cr/… open sounds, everything else → sample row); pitched note insertion
+  on Drift/Boogie into the current piano-roll lane. Undo-free of spam: one snapshot
+  per ~half-second of performance. Live note feedback (note name + velocity) in the
+  status line when not recording.
+- **Streaming render pipeline (phase 1)** — playback bounces now run on a dedicated
+  worker thread with live per-bar progress in the status bar; the entire UI —
+  transport, mixer, and the new MIDI-in — stays fully responsive during renders.
+  Playback starts automatically the instant production finishes.
+- **Verified by the gate**: 19/19 tests. New proofs: raw MIDI wire parsing incl.
+  velocity-0-as-off / channel masks / garbage-safety, GM mapping table, and the
+  streaming-parity test asserting the progressive renderer is **bit-identical** to
+  the standard one with monotonic per-bar progress (the guarantee that progress
+  reporting can never change your audio). Clippy zero-warnings, rustfmt clean.
+
 ## [1.1.0] — 2026-10-18
 
 ### Added — Mastering & Delivery pass ("beat the DAWs" sprint)

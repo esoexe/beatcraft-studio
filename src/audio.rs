@@ -105,6 +105,17 @@ pub fn write_wav_depth(
 }
 
 pub fn render(project: &Project, sample_rate: u32) -> Result<Vec<f32>> {
+    render_with_progress(project, sample_rate, None)
+}
+
+/// Same renderer as [`render`], optionally invoking `progress(0.0..=1.0)` as each
+/// arrangement bar is synthesized. Parallel/deterministic — progress is a pure
+/// side-channel and never changes the audio.
+pub fn render_with_progress(
+    project: &Project,
+    sample_rate: u32,
+    mut progress: Option<&mut dyn FnMut(f32)>,
+) -> Result<Vec<f32>> {
     let bpm = project.bpm.clamp(50, 200) as f32;
     let step_seconds = 60.0 / bpm / 4.0;
     let bars = project.arrangement.len().max(1);
@@ -124,6 +135,9 @@ pub fn render(project: &Project, sample_rate: u32) -> Result<Vec<f32>> {
     let mut sample_cache: HashMap<String, SampleClip> = HashMap::new();
 
     for (bar, slot) in project.arrangement.iter().enumerate() {
+        if let Some(cb) = progress.as_deref_mut() {
+            cb(bar as f32 / bars.max(1) as f32);
+        }
         let Some(id) = slot.as_ref() else {
             continue;
         };
@@ -664,6 +678,37 @@ fn automation_value(
     lane.points.last().map(|p| p.value)
 }
 
+/// Render job executed on a worker thread; the UI (or any caller) stays fully
+/// responsive while bouncing. Progress messages stream in as bars complete.
+pub enum RenderMsg {
+    Progress { bar: usize, bars: usize },
+    Done(Result<Vec<f32>, String>),
+}
+
+pub fn spawn_render(
+    project: Project,
+    sample_rate: u32,
+) -> (
+    std::sync::mpsc::Receiver<RenderMsg>,
+    std::thread::JoinHandle<()>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let bars = project.arrangement.len().max(1);
+        let result = render_with_progress(
+            &project,
+            sample_rate,
+            Some(&mut |p: f32| {
+                let bar = (p * bars as f32) as usize;
+                let _ = tx.send(RenderMsg::Progress { bar, bars });
+            }),
+        )
+        .map_err(|e| e.to_string());
+        let _ = tx.send(RenderMsg::Done(result));
+    });
+    (rx, handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -841,6 +886,32 @@ mod mastering_tests {
             out.len().is_multiple_of(2) && peak <= 0.4 + 1e-3,
             "render peak {peak} over suite ceiling"
         );
+    }
+
+    #[test]
+    fn progressive_render_is_bit_identical_and_reports_monotonic_progress() {
+        // THE streaming-correctness proof: the progress-reporting variant must
+        // produce the exact same bytes as plain render(), with monotonic progress.
+        let project = default_project("iftar");
+        let plain = render(&project, 44_100).unwrap();
+        let mut marks = Vec::new();
+        let progressive =
+            render_with_progress(&project, 44_100, Some(&mut |p| marks.push(p))).unwrap();
+        assert_eq!(
+            progressive.len(),
+            plain.len(),
+            "streamed render diverged in length"
+        );
+        assert_eq!(progressive, plain, "streamed render is not bit-identical");
+        assert!(
+            marks.len() >= project.arrangement.len(),
+            "progress not reported per bar"
+        );
+        assert!(
+            marks.windows(2).all(|w| w[0] <= w[1]),
+            "progress not monotonic"
+        );
+        assert!(marks.iter().all(|m| (0.0..=1.0).contains(m)));
     }
 
     #[test]

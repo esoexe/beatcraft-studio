@@ -399,3 +399,186 @@ mod tests {
         let _ = std::fs::remove_file(dir);
     }
 }
+
+// ───────────────────────── hardware MIDI input (live) ─────────────────────────
+
+/// A decoded live performance event from any connected controller/keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveMidiEvent {
+    NoteOn {
+        channel: u8,
+        pitch: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        channel: u8,
+        pitch: u8,
+    },
+    ControlChange {
+        channel: u8,
+        controller: u8,
+        value: u8,
+    },
+}
+
+/// Turn raw wire bytes into an event. Pure + total: any garbage input yields None.
+/// Note-velocity-0 is NoteOff per the spec. Running status is not reconstructed
+/// here (midir delivers complete channel messages on all desktop OSes).
+pub fn parse_live_message(bytes: &[u8]) -> Option<LiveMidiEvent> {
+    let status = *bytes.first()?;
+    let channel = status & 0x0F;
+    match status & 0xF0 {
+        0x90 => {
+            let pitch = *bytes.get(1)?;
+            let velocity = *bytes.get(2)?;
+            if pitch > 127 || velocity > 127 {
+                return None;
+            }
+            if velocity == 0 {
+                Some(LiveMidiEvent::NoteOff { channel, pitch })
+            } else {
+                Some(LiveMidiEvent::NoteOn {
+                    channel,
+                    pitch,
+                    velocity,
+                })
+            }
+        }
+        0x80 => {
+            let pitch = *bytes.get(1)?;
+            (pitch <= 127).then_some(LiveMidiEvent::NoteOff { channel, pitch })
+        }
+        0xB0 => {
+            let controller = *bytes.get(1)?;
+            let value = *bytes.get(2)?;
+            Some(LiveMidiEvent::ControlChange {
+                channel,
+                controller,
+                value,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Live input session; dropping it releases the OS MIDI port.
+pub struct MidiInputSession {
+    _connection: midir::MidiInputConnection<()>,
+    pub device_name: String,
+    pub rx: std::sync::mpsc::Receiver<(std::time::Instant, LiveMidiEvent)>,
+}
+
+/// Names of all currently advertised MIDI input ports (never fails).
+pub fn list_input_devices() -> Vec<String> {
+    (|| -> anyhow::Result<Vec<String>> {
+        let input = midir::MidiInput::new("BeatCraft scan")?;
+        Ok(input
+            .ports()
+            .iter()
+            .map(|p| input.port_name(p).unwrap_or_default())
+            .collect())
+    })()
+    .unwrap_or_default()
+}
+
+/// Connect to the input port matching `name` (exact match falls back to first port).
+pub fn connect_input(name: &str) -> Option<MidiInputSession> {
+    let input = midir::MidiInput::new("BeatCraft MIDI-in").ok()?;
+    let ports = input.ports();
+    let port = ports
+        .iter()
+        .find(|p| input.port_name(p).ok().as_deref() == Some(name))
+        .or(ports.first())?;
+    let device_name = input
+        .port_name(port)
+        .unwrap_or_else(|_| "MIDI device".into());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let connection = input
+        .connect(
+            port,
+            "beatcraft-midi-in",
+            move |_ts, bytes, _| {
+                if let Some(event) = parse_live_message(bytes) {
+                    let _ = tx.send((std::time::Instant::now(), event));
+                }
+            },
+            (),
+        )
+        .ok()?;
+    Some(MidiInputSession {
+        _connection: connection,
+        device_name,
+        rx,
+    })
+}
+
+/// GM-style mapping of a pitched key to a BeatForge-style drum row id.
+pub fn drum_row_for_pitch(pitch: u8) -> &'static str {
+    match pitch {
+        35 | 36 => "kick",
+        38..=40 => "snare",
+        42 | 44 | 46 | 51 => "hat",
+        49 | 52 | 56 => "cowbell",
+        _ => "sample",
+    }
+}
+
+#[cfg(test)]
+mod live_midi_tests {
+    use super::*;
+
+    #[test]
+    fn parses_note_on_and_velocity_zero_off() {
+        assert_eq!(
+            parse_live_message(&[0x90, 60, 100]),
+            Some(LiveMidiEvent::NoteOn {
+                channel: 0,
+                pitch: 60,
+                velocity: 100
+            })
+        );
+        assert_eq!(
+            parse_live_message(&[0x90, 60, 0]),
+            Some(LiveMidiEvent::NoteOff {
+                channel: 0,
+                pitch: 60
+            })
+        );
+    }
+
+    #[test]
+    fn parses_channels_cc_and_off_messages() {
+        assert_eq!(
+            parse_live_message(&[0x89, 64, 12]),
+            Some(LiveMidiEvent::NoteOff {
+                channel: 9,
+                pitch: 64
+            })
+        );
+        assert_eq!(
+            parse_live_message(&[0xB2, 1, 90]),
+            Some(LiveMidiEvent::ControlChange {
+                channel: 2,
+                controller: 1,
+                value: 90
+            })
+        );
+    }
+
+    #[test]
+    fn garbage_and_short_frames_are_safe() {
+        assert_eq!(parse_live_message(&[]), None);
+        assert_eq!(parse_live_message(&[0x90]), None);
+        assert_eq!(parse_live_message(&[0x90, 128, 90]), None);
+        assert_eq!(parse_live_message(&[0xF0, 1, 2]), None); // sysex start ignored
+    }
+
+    #[test]
+    fn gm_mapping_is_stable() {
+        assert_eq!(drum_row_for_pitch(36), "kick");
+        assert_eq!(drum_row_for_pitch(38), "snare");
+        assert_eq!(drum_row_for_pitch(42), "hat");
+        assert_eq!(drum_row_for_pitch(56), "cowbell");
+        assert_eq!(drum_row_for_pitch(72), "sample");
+    }
+}

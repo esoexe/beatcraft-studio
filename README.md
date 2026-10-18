@@ -24,7 +24,7 @@ The launcher uses subtle animated accent borders. During playback, a moving sequ
 
 ![Piano roll](screenshots/piano-roll.png)
 
-## V1.1 features
+## V1.2 features
 
 - **Four floors, one launcher** — BeatForge (drums), Drift (gliding bass), Boogie
   (keys/leads), Rhythm (polyrhythm layers) — each a complete standalone studio.
@@ -32,6 +32,8 @@ The launcher uses subtle animated accent borders. During playback, a moving sequ
   all editable with undo/redo everywhere.
 - **Full mixer** — per-track volume, pan, mute/solo, transient shaper, drive,
   chorus/delay send FX.
+- **Hardware MIDI-in** *(new in 1.2)* — connect any controller, arm MIDI REC, play along: notes quantize straight onto the grid, GM-mapped on drum floors, pitched on Drift/Boogie.
+- **Streaming render pipeline** *(new in 1.2)* — bounces run on a background worker with live bar progress; UI stays live; playback rolls the moment audio lands.
 - **MASTER SUITE mastering chain** *(new in 1.1)* — 3-band EQ, mid/side stereo
   width, feedforward compressor and tanh limiter on the final buss, right in the
   mixer — bounce loud, finished masters.

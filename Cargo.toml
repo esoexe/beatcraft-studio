@@ -1,6 +1,6 @@
 [package]
 name = "beatcraft-studio"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "A native, local-first Rust desktop beatmaking studio for phonk and funk."
@@ -33,6 +33,7 @@ eframe = { version = "0.31.1", default-features = false, features = ["default_fo
 hound = "3.5"
 image = { version = "0.25", default-features = false, features = ["png"] }
 midly = "0.5.3"
+midir = "0.10"
 cpal = "0.15.3"
 rfd = { version = "0.15.4", default-features = false, features = ["xdg-portal", "async-std"] }
 rtrb = "0.3.2"
