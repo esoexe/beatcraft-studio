@@ -32,6 +32,10 @@ The launcher uses subtle animated accent borders. During playback, a moving sequ
   all editable with undo/redo everywhere.
 - **Full mixer** — per-track volume, pan, mute/solo, transient shaper, drive,
   chorus/delay send FX.
+- **PDC + parameter hosting + MIDI bridging** *(new in 2.7)* — plugin
+  latencies are compensated per track (sample-aligned against built-in
+  voices), every plugin parameter is editable and stored per project, and
+  MIDI-only instruments are bridged into note lanes automatically.
 - **CLAP instruments** *(new in 2.6)* — "+ Add plugin track" turns any CLAP
   **instrument** on your system into a purple track played by the tracker,
   piano roll, or MIDI-in; sample-accurate note gates, persistent instances, and

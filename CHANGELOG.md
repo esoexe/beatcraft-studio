@@ -2,6 +2,43 @@
 
 All notable changes to BeatCraft Studio are documented here.
 
+## [2.7.0] — 2026-10-18
+
+### Added — PDC, parameter hosting, MIDI bridging
+
+- **Plugin-delay compensation (PDC) on tracks.** CLAP instruments report
+  `clap.latency`; every track is shifted onto the slowest plugin track's time
+  base with a persistent carry, so a 64-sample-latency synth lands its notes
+  sample-aligned with the built-in voices. The direction is spec-standard
+  (delay everyone to the slowest), the carry is seamless across chunk borders
+  (unit-tested), and the master insert deliberately stays uniform-shifted —
+  whole-mix delay changes nothing audible. Master-insert latency is reported
+  but intentionally uncompensated (documented).
+- **Full parameter hosting.** Plugins are queried for `clap.params`
+  (hidden/read-only/bypass params filtered), and every parameter is editable
+  in a generic slider panel: "CLAP parameters" under the master FX picker,
+  "Instrument parameters" in the piano roll for plugin tracks. Values persist
+  in the project (`ClapInsert.params`) and are delivered as sample-accurate
+  `clap_event_param_value` events at sample 0 of the first processed tile —
+  verified against a parameterized fixture: exact `(id, time, value)` receipt
+  and effect applied from the first sample. Plugin default state is playback
+  until you touch a slider.
+- **MIDI-dialect bridging.** Instruments whose note ports only speak the MIDI
+  dialect now work: note lanes are bridged to `clap_event_midi` 0x90/0x80
+  frames with velocity mapped to 1..127, negotiated per plugin at load
+  (CLAP dialect preferred). Tested with a MIDI-only fixture.
+- The input event pipeline was generalized into a unified, spec-sorted event
+  set (notes + param values + bridged MIDI share one list per processing
+  tile). 31/31 tests, clippy/fmt clean.
+
+### Not yet (honesty ledger)
+
+- No plugin GUI embedding — native window parenting across three OSes is
+  being held back until it can be validated on real systems, per the
+  no-claims-without-proof rule.
+- No per-note expressions/MPE, no lane-based parameter automation
+  (parameters are set-and-stored, not automated over time), no sidechain yet.
+
 ## [2.6.0] — 2026-10-18
 
 ### Added — CLAP instruments

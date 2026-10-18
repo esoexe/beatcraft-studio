@@ -143,6 +143,9 @@ pub struct ClapInsert {
     /// Display name cached for the UI.
     pub name: String,
     pub enabled: bool,
+    /// Stored parameter values (param id → plain value), applied at load.
+    #[serde(default)]
+    pub params: Vec<(u32, f64)>,
 }
 
 /// Master-bus mastering chain: 3-band EQ → stereo width → compressor → limiter.

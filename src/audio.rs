@@ -318,6 +318,7 @@ fn render_core_impl(
     // CLAP instruments: one continuous pass per track after the source loop
     // and before per-track FX. The persistent instance plus absolute event
     // filtering make this tile-identical to the streaming engine.
+    let mut track_latencies: Vec<(usize, usize)> = Vec::new();
     for (track_index, track) in project.tracks.iter().enumerate() {
         if track.kind != TrackKind::Plugin {
             continue;
@@ -334,8 +335,28 @@ fn render_core_impl(
             &insert.plugin_id,
             sample_rate,
         ) {
-            Ok(mut synth) => synth.render_window(&mut stems[track_index], 0, &events),
+            Ok(mut synth) => {
+                synth.apply_initial(&insert.params);
+                track_latencies.push((track_index, synth.latency()));
+                synth.render_window(&mut stems[track_index], 0, &events);
+            }
             Err(e) => eprintln!("CLAP instrument '{}' skipped: {e}", insert.name),
+        }
+    }
+    // PDC: shift every stem so all tracks ride the slowest plugin's time base.
+    let latency_max = track_latencies.iter().map(|l| l.1).max().unwrap_or(0);
+    if latency_max > 0 {
+        for (track_index, stem) in stems.iter_mut().enumerate() {
+            let lt = track_latencies
+                .iter()
+                .find(|l| l.0 == track_index)
+                .map(|l| l.1)
+                .unwrap_or(0);
+            let shift = latency_max.saturating_sub(lt);
+            if shift > 0 {
+                let mut pending = vec![0.0_f32; shift * 2];
+                apply_latency_shift(stem, &mut pending);
+            }
         }
     }
 
@@ -384,7 +405,10 @@ fn master_fx_instance(project: &Project, sample_rate: u32) -> Option<crate::clap
         &insert.plugin_id,
         sample_rate,
     ) {
-        Ok(fx) => Some(fx),
+        Ok(mut fx) => {
+            fx.apply_initial(&insert.params);
+            Some(fx)
+        }
         Err(e) => {
             eprintln!("CLAP insert '{}' skipped: {e}", insert.name);
             None
@@ -896,6 +920,26 @@ pub fn spawn_render(
 struct StemStream {
     fx: FxState,
     pending: Vec<f32>, // interleaved stereo source overflow into later window
+    /// Per-track latency-alignment carry: `(Lmax − track latency) * 2` samples
+    /// of leading silence on the first window, then carry afterward.
+    shift_pending: Vec<f32>,
+}
+
+/// Shift `window` right by `pending.len()/2` frames, using `pending` as the
+/// persistent carry. This is the track-latency alignment primitive: every
+/// stream prepends `Lmax − latency` frames of silence so all tracks land on
+/// the slowest plugin's time base (standard PDC). Content shifted past the
+/// window end is carried into the next call, so the stream is seamless.
+fn apply_latency_shift(window: &mut [f32], pending: &mut Vec<f32>) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut combined = std::mem::take(pending);
+    combined.extend_from_slice(window);
+    let w = window.len();
+    window.copy_from_slice(&combined[..w]);
+    combined.drain(..w);
+    *pending = combined;
 }
 
 pub struct StreamingRender<'p> {
@@ -937,15 +981,8 @@ impl<'p> StreamingRender<'p> {
             .filter(|(_, t)| !(t.mute || (any_solo && !t.solo)))
             .map(|(i, _)| i)
             .collect();
-        let tracks = included
-            .iter()
-            .map(|i| StemStream {
-                fx: FxState::new(&project.tracks[*i].fx, sample_rate),
-                pending: Vec::new(),
-            })
-            .collect();
         // CLAP instruments come online once and stream across the whole bounce.
-        let synths = included
+        let synths: Vec<Option<crate::clap::ClapSynth>> = included
             .iter()
             .map(|&ti| {
                 let track = &project.tracks[ti];
@@ -958,12 +995,47 @@ impl<'p> StreamingRender<'p> {
                     &insert.plugin_id,
                     sample_rate,
                 ) {
-                    Ok(synth) => Some(synth),
+                    Ok(mut synth) => {
+                        synth.apply_initial(&insert.params);
+                        Some(synth)
+                    }
                     Err(e) => {
                         eprintln!("CLAP instrument '{}' skipped: {e}", insert.name);
                         None
                     }
                 }
+            })
+            .collect();
+        // PDC: align every stream to the slowest plugin track.
+        let latency_max = synths
+            .iter()
+            .filter_map(|s| s.as_ref().map(crate::clap::ClapSynth::latency))
+            .max()
+            .unwrap_or(0);
+        let shift_seeds: Vec<Vec<f32>> = included
+            .iter()
+            .map(|&ti| {
+                let lt = project.tracks[ti]
+                    .clap_instrument
+                    .as_ref()
+                    .filter(|i| i.enabled)
+                    .and_then(|_| {
+                        included
+                            .iter()
+                            .position(|x| *x == ti)
+                            .and_then(|pos| synths[pos].as_ref().map(|s| s.latency()))
+                    })
+                    .unwrap_or(0);
+                vec![0.0_f32; (latency_max.saturating_sub(lt)) * 2]
+            })
+            .collect();
+        let tracks = included
+            .iter()
+            .enumerate()
+            .map(|(pos, i)| StemStream {
+                fx: FxState::new(&project.tracks[*i].fx, sample_rate),
+                pending: Vec::new(),
+                shift_pending: shift_seeds[pos].clone(),
             })
             .collect();
         Self {
@@ -1050,6 +1122,7 @@ impl<'p> StreamingRender<'p> {
                     synth.render_window(&mut window, start_frame, &events);
                 }
             }
+            apply_latency_shift(&mut window, &mut self.tracks[track_pos].shift_pending);
             self.tracks[track_pos].fx.process(&mut window);
             processed.push(window);
         }
@@ -1411,6 +1484,33 @@ pub fn spawn_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn latency_shift_aligns_with_persistent_carry() {
+        // 2-frame shift (4 interleaved samples of carry)
+        let mut a: Vec<f32> = vec![0.0; 8];
+        a[0] = 1.0;
+        let mut pending = vec![0.0_f32; 4];
+        apply_latency_shift(&mut a, &mut pending);
+        assert_eq!(&a[..4], &[0.0; 4]);
+        assert_eq!(a[4], 1.0);
+        // A marker near the window end overflows into the carry, then spills
+        // onto the next window's head — the seam stays seamless.
+        a = vec![0.0; 8];
+        a[6] = 1.0;
+        apply_latency_shift(&mut a, &mut pending);
+        assert!(a.iter().all(|v| *v == 0.0));
+        assert_eq!(pending, vec![0.0, 0.0, 1.0, 0.0]);
+        let mut b = vec![2.0_f32; 8];
+        apply_latency_shift(&mut b, &mut pending);
+        assert_eq!(b[2], 1.0);
+        assert_eq!(&b[4..], &[2.0; 4]);
+        // An empty carry is an identity shift (no-op fast path).
+        let mut none: Vec<f32> = Vec::new();
+        let before = b.clone();
+        apply_latency_shift(&mut b, &mut none);
+        assert_eq!(b, before);
+    }
+
     use crate::model::{default_project, AutomationLane, AutomationPoint, Note};
     #[test]
     fn renderer_makes_finite_stereo() {

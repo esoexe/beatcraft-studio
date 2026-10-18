@@ -519,6 +519,18 @@ impl BeatCraftApp {
                 ui.horizontal(|ui|{
                     ui.label(RichText::new("PIANO ROLL").small().strong().color(color("#9AA5B5")));
                     egui::ComboBox::from_id_salt("piano-track").selected_text(track_name(project,&self.selected_track)).show_ui(ui,|ui|{for track in project.tracks.iter().filter(|t|matches!(t.kind,TrackKind::Sub|TrackKind::Bass|TrackKind::Keys|TrackKind::Plugin)){ui.selectable_value(&mut self.selected_track,track.id.clone(),&track.name);}});
+                    {
+                        let idx = project.tracks.iter().position(|t| t.id == self.selected_track);
+                        if let Some(ti) = idx {
+                            if project.tracks[ti].kind == TrackKind::Plugin {
+                                if let Some(insert) = project.tracks[ti].clap_instrument.as_mut() {
+                                    ui.collapsing("Instrument parameters", |ui| {
+                                        draw_clap_param_editor(ui, insert, actions);
+                                    });
+                                }
+                            }
+                        }
+                    }
                     ui.label(RichText::new("New note length").color(color("#E5E8E0")));ui.add(egui::DragValue::new(&mut self.note_length).range(1..=16).suffix(" steps"));
                     ui.label(RichText::new("Velocity").color(color("#E5E8E0")));ui.add(egui::Slider::new(&mut self.note_velocity,1..=127).show_value(true));
                     if ui.button("Clear track notes").clicked() {
@@ -634,6 +646,7 @@ impl BeatCraftApp {
                                                 plugin_id: info.id.clone(),
                                                 name: info.name.clone(),
                                                 enabled: true,
+                                                params: Vec::new(),
                                             });
                                             actions.changed = true;
                                         }
@@ -645,6 +658,11 @@ impl BeatCraftApp {
                                 }
                             }
                         });
+                        if let Some(insert) = &mut project.master_clap {
+                            ui.collapsing("CLAP parameters", |ui| {
+                                draw_clap_param_editor(ui, insert, actions);
+                            });
+                        }
                     });
                     ui.add_space(8.0);
                 }
@@ -687,6 +705,7 @@ impl BeatCraftApp {
                                                 plugin_id: info.id.clone(),
                                                 name: info.name.clone(),
                                                 enabled: true,
+                                                params: Vec::new(),
                                             }),
                                         });
                                         for pat in &mut project.patterns {
@@ -1559,6 +1578,55 @@ fn configure_theme(ctx: &egui::Context) {
     style.spacing.button_padding = Vec2::new(10.0, 6.0);
     ctx.set_style(style);
 }
+/// Generic CLAP parameter editor: sliders over the plugin's enumerated
+/// params; values persist into the insert and apply at the next render.
+fn draw_clap_param_editor(
+    ui: &mut egui::Ui,
+    insert: &mut crate::model::ClapInsert,
+    actions: &mut UiActions,
+) {
+    let params = crate::clap::inspect_params(std::path::Path::new(&insert.path), &insert.plugin_id)
+        .unwrap_or_default();
+    if params.is_empty() {
+        ui.label(
+            RichText::new("This plugin exposes no user-facing parameters.")
+                .small()
+                .color(color("#8792A2")),
+        );
+        return;
+    }
+    egui::Grid::new(format!("clap-params-{}", insert.plugin_id))
+        .num_columns(1)
+        .show(ui, |ui| {
+            for p in &params {
+                let current = insert
+                    .params
+                    .iter()
+                    .find(|(id, _)| *id == p.id)
+                    .map(|kv| kv.1)
+                    .unwrap_or(p.default_value);
+                let mut v = current;
+                let label = if p.module.is_empty() {
+                    p.name.clone()
+                } else {
+                    format!("{}/{}", p.module, p.name)
+                };
+                if ui
+                    .add(egui::Slider::new(&mut v, p.min_value..=p.max_value).text(label))
+                    .changed()
+                {
+                    if let Some(kv) = insert.params.iter_mut().find(|(id, _)| *id == p.id) {
+                        kv.1 = v;
+                    } else {
+                        insert.params.push((p.id, v));
+                    }
+                    actions.changed = true;
+                }
+                ui.end_row();
+            }
+        });
+}
+
 fn color(value: &str) -> Color32 {
     let s = value.trim_start_matches('#');
     if s.len() == 6 {

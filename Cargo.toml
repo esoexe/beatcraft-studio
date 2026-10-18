@@ -1,6 +1,6 @@
 [package]
 name = "beatcraft-studio"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2021"
 rust-version = "1.88"
 description = "A native, local-first Rust desktop beatmaking studio for phonk and funk."

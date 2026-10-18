@@ -38,8 +38,16 @@ const CLAP_FEATURE_AUDIO_EFFECT: &str = "audio-effect";
 /// plugin-features.h: a note event-driven sound generator.
 const CLAP_FEATURE_INSTRUMENT: &str = "instrument";
 const CLAP_EXT_NOTE_PORTS: &[u8] = b"clap.note-ports\0";
+const CLAP_EXT_PARAMS: &[u8] = b"clap.params\0";
+const CLAP_EXT_LATENCY: &[u8] = b"clap.latency\0";
 const CLAP_EVENT_NOTE_ON: u16 = 0;
 const CLAP_EVENT_NOTE_OFF: u16 = 1;
+const CLAP_EVENT_PARAM_VALUE: u16 = 5;
+const CLAP_EVENT_MIDI: u16 = 10;
+const CLAP_NOTE_DIALECT_CLAP: u32 = 1;
+const CLAP_NOTE_DIALECT_MIDI: u32 = 2;
+/// Max plugin latency we'll honour; beyond this something is pathological.
+const MAX_LATENCY_PRIME: usize = 8192;
 const CLAP_NAME_SIZE: usize = 256;
 const CLAP_INVALID_ID: u32 = u32::MAX;
 
@@ -453,9 +461,11 @@ pub fn scan_instruments() -> Vec<(PathBuf, PluginInfo)> {
 
 /* ─────────────────────────── instance: headless stereo FX ─────────────────────────── */
 
+#[cfg(test)]
 extern "C" fn empty_events_size(_list: *const ClapInputEvents) -> u32 {
     0
 }
+#[cfg(test)]
 extern "C" fn empty_events_get(_l: *const ClapInputEvents, _idx: u32) -> *const ClapEventHeader {
     std::ptr::null()
 }
@@ -465,6 +475,7 @@ extern "C" fn sink_events_try_push(
 ) -> bool {
     true
 }
+#[cfg(test)]
 static EMPTY_INPUT_EVENTS: SyncStatic<ClapInputEvents> = SyncStatic(ClapInputEvents {
     ctx: std::ptr::null_mut(),
     size: empty_events_size,
@@ -481,83 +492,95 @@ static SINK_OUTPUT_EVENTS: SyncStatic<ClapOutputEvents> = SyncStatic(ClapOutputE
 /// instance keeps an absolute frame counter so calls tile identically no
 /// matter how the caller chunks the timeline (see module docs).
 pub struct ClapFx {
-    // Field order matters: destroyed plugin (Drop) first, then the bundle.
-    plugin: *const ClapPlugin,
-    stopped: bool,
-    out_channels: usize,
-    in_channels: usize,
-    world_pos: usize,
+    core: FxCore,
     _bundle: OwnedBundle,
 }
-// SAFETY: ClapFx is created, driven and dropped on one thread at a time
-// (the bounce thread or the streaming worker). The raw plugin pointer is
-// only ever dereferenced from `process_chunk`/`Drop`, which take `&mut self`.
+// SAFETY: single-threaded ownership at a time (bounce or streaming worker).
 unsafe impl Send for ClapFx {}
 
-impl ClapFx {
-    /// Load `plugin_id` from the bundle at `path`, activate at `sr`.
-    pub fn load(path: &Path, plugin_id: &str, sr: u32) -> Result<Self> {
-        let bundle = unsafe { open_bundle(path)? };
-        let path_c = CString::new(path.to_string_lossy().as_ref())?;
-        if !(bundle.entry.init)(path_c.as_ptr()) {
-            anyhow::bail!("entry init() failed for {}", path.display());
-        }
-        let factory = (bundle.entry.get_factory)(CLAP_PLUGIN_FACTORY_ID.as_ptr() as *const c_char)
-            as *const ClapPluginFactory;
-        let factory = unsafe { factory.as_ref() }.context("no plugin factory")?;
-        let id_c = CString::new(plugin_id)?;
-        let plugin = (factory.create_plugin)(factory, host_struct(), id_c.as_ptr());
-        let plugin_ref = unsafe { plugin.as_ref() }.context("create_plugin returned null")?;
-        if !(plugin_ref.init)(plugin_ref) {
-            anyhow::bail!("plugin init failed for {}", plugin_id);
-        }
-        let (in_channels, out_channels) = inspect_ports(plugin_ref);
-        if out_channels == 0 {
-            (plugin_ref.destroy)(plugin_ref);
-            anyhow::bail!("{} has no audio outputs", plugin_id);
-        }
-        if !(plugin_ref.activate)(plugin_ref, sr as f64, 32, TILE as u32) {
-            (plugin_ref.destroy)(plugin_ref);
-            anyhow::bail!("activate failed for {}", plugin_id);
-        }
-        if !(plugin_ref.start_processing)(plugin_ref) {
-            (plugin_ref.deactivate)(plugin_ref);
-            (plugin_ref.destroy)(plugin_ref);
-            anyhow::bail!("start_processing failed for {}", plugin_id);
-        }
-        Ok(ClapFx {
+/// Backlinks shared by FX and instrument cores.
+fn plugin_latency(plugin: &ClapPlugin) -> usize {
+    let ext = (plugin.get_extension)(plugin, CLAP_EXT_LATENCY.as_ptr() as *const c_char)
+        as *const ClapPluginLatency;
+    unsafe { ext.as_ref() }
+        .map(|l| (l.get)(plugin) as usize)
+        .unwrap_or(0)
+        .min(MAX_LATENCY_PRIME)
+}
+
+/// The testable heart of [`ClapFx`]; exists so unit tests can drive the
+/// production rendering machinery with an in-process plugin.
+struct FxCore {
+    plugin: *const ClapPlugin,
+    in_channels: usize,
+    out_channels: usize,
+    world_pos: usize,
+    /// Declared plugin latency in frames; the master insert deliberately does
+    /// *not* compensate (a master-bus delay shifts the whole bounce uniformly,
+    /// which changes nothing audible). It is reported for diagnostics.
+    latency: usize,
+    stopped: bool,
+    pending_params: Vec<(u32, f64)>,
+}
+// SAFETY: same single-threaded discipline as ClapFx.
+unsafe impl Send for FxCore {}
+
+impl FxCore {
+    fn new(plugin: *const ClapPlugin, in_channels: usize, out_channels: usize) -> Self {
+        Self {
             plugin,
-            stopped: false,
-            out_channels,
             in_channels,
+            out_channels,
             world_pos: 0,
-            _bundle: bundle,
-        })
+            latency: 0,
+            stopped: false,
+            pending_params: Vec::new(),
+        }
     }
 
-    /// Run `buf` (interleaved stereo f32) through the plugin in place.
-    pub fn process_chunk(&mut self, buf: &mut [f32]) {
+    fn with_latency(
+        plugin: *const ClapPlugin,
+        in_channels: usize,
+        out_channels: usize,
+        latency: usize,
+    ) -> Self {
+        let mut core = Self::new(plugin, in_channels, out_channels);
+        core.latency = latency.min(MAX_LATENCY_PRIME);
+        core
+    }
+
+    fn set_param(&mut self, id: u32, value: f64) {
+        self.pending_params.push((id, value));
+    }
+
+    fn process_chunk(&mut self, buf: &mut [f32]) {
         if self.stopped {
             return;
         }
+        self.run_span(buf);
+    }
+
+    fn run_span(&mut self, buf: &mut [f32]) {
         let total = buf.len() / 2;
         let mut off = 0usize;
         while off < total {
             match self.sub_render(buf, off, total) {
                 Some(n) => off += n,
-                None => return, // poisoned — leave remaining audio dry
+                None => return,
             }
         }
     }
 
-    /// Render one tile starting at frame-offset `off` inside `buf`.
-    /// Returns the tile width, or `None` if the plugin poisoned itself.
     fn sub_render(&mut self, buf: &mut [f32], off: usize, total: usize) -> Option<usize> {
         let grid = TILE - (self.world_pos % TILE);
         let n = grid.min(total - off);
         let plugin = unsafe { &*self.plugin };
 
-        // planar inputs
+        let mut set = EventSet::default();
+        self.drain_params_into(&mut set);
+        set.sort_and_index();
+        let in_events = set.as_input();
+
         let mut in_l: Vec<f32> = Vec::new();
         let mut in_r: Vec<f32> = Vec::new();
         if self.in_channels > 0 {
@@ -606,18 +629,16 @@ impl ClapFx {
             audio_outputs: &mut out_buf,
             audio_inputs_count: u32::from(self.in_channels > 0),
             audio_outputs_count: 1,
-            in_events: &EMPTY_INPUT_EVENTS.0,
+            in_events: &in_events,
             out_events: &SINK_OUTPUT_EVENTS.0,
         };
         let status = (plugin.process)(plugin, &process);
         self.world_pos += n;
         if status == 0 {
-            // CLAP_PROCESS_ERROR: poison the instance, pass audio dry.
             self.stopped = true;
             eprintln!("CLAP plugin reported CLAP_PROCESS_ERROR; bypassing");
             return None;
         }
-        // TAIL/SLEEP are ignored — we always have fresh input next call.
         let lch = &out_bufs[0];
         let rch = out_bufs.get(1).unwrap_or(lch);
         for (i, (&l, &r)) in lch.iter().zip(rch.iter()).enumerate() {
@@ -626,18 +647,271 @@ impl ClapFx {
         }
         Some(n)
     }
+
+    fn drain_params_into(&mut self, set: &mut EventSet) {
+        if !self.pending_params.is_empty() {
+            self.pending_params.sort_by_key(|p| p.0);
+            for (id, v) in self.pending_params.drain(..) {
+                set.push_param(0, id, v);
+            }
+        }
+    }
+}
+
+impl ClapFx {
+    /// Load `plugin_id` from the bundle at `path`, activate at `sr`.
+    pub fn load(path: &Path, plugin_id: &str, sr: u32) -> Result<Self> {
+        let bundle = unsafe { open_bundle(path)? };
+        let path_c = CString::new(path.to_string_lossy().as_ref())?;
+        if !(bundle.entry.init)(path_c.as_ptr()) {
+            anyhow::bail!("entry init() failed for {}", path.display());
+        }
+        let factory = (bundle.entry.get_factory)(CLAP_PLUGIN_FACTORY_ID.as_ptr() as *const c_char)
+            as *const ClapPluginFactory;
+        let factory = unsafe { factory.as_ref() }.context("no plugin factory")?;
+        let id_c = CString::new(plugin_id)?;
+        let plugin = (factory.create_plugin)(factory, host_struct(), id_c.as_ptr());
+        let plugin_ref = unsafe { plugin.as_ref() }.context("create_plugin returned null")?;
+        if !(plugin_ref.init)(plugin_ref) {
+            anyhow::bail!("plugin init failed for {}", plugin_id);
+        }
+        let (in_channels, out_channels) = inspect_ports(plugin_ref);
+        if out_channels == 0 {
+            (plugin_ref.destroy)(plugin_ref);
+            anyhow::bail!("{} has no audio outputs", plugin_id);
+        }
+        if !(plugin_ref.activate)(plugin_ref, sr as f64, 32, TILE as u32) {
+            (plugin_ref.destroy)(plugin_ref);
+            anyhow::bail!("activate failed for {}", plugin_id);
+        }
+        if !(plugin_ref.start_processing)(plugin_ref) {
+            (plugin_ref.deactivate)(plugin_ref);
+            (plugin_ref.destroy)(plugin_ref);
+            anyhow::bail!("start_processing failed for {}", plugin_id);
+        }
+        let latency = plugin_latency(plugin_ref);
+        Ok(ClapFx {
+            core: FxCore::with_latency(plugin, in_channels, out_channels, latency),
+            _bundle: bundle,
+        })
+    }
+
+    /// Run `buf` (interleaved stereo f32) through the plugin in place.
+    pub fn process_chunk(&mut self, buf: &mut [f32]) {
+        self.core.process_chunk(buf);
+    }
+
+    /// Queue an initial parameter batch, delivered as time-0 PARAM_VALUE
+    /// events on the first processed tile (deterministic, spec automation).
+    pub fn apply_initial(&mut self, params: &[(u32, f64)]) {
+        for &(id, v) in params {
+            self.core.set_param(id, v);
+        }
+    }
+
+    /// Queue a parameter change for the next processed tile.
+    pub fn set_param(&mut self, id: u32, value: f64) {
+        self.core.set_param(id, value);
+    }
+
+    /// Enumerate the plugin's user-facing parameters.
+    pub fn list_params(&self) -> Vec<ParamInfo> {
+        read_params(unsafe { &*self.core.plugin })
+    }
+
+    /// Declared plugin latency in frames (uncompensated on the master buss).
+    pub fn latency(&self) -> usize {
+        self.core.latency
+    }
 }
 
 impl Drop for ClapFx {
     fn drop(&mut self) {
-        let plugin = unsafe { &*self.plugin };
+        let plugin = unsafe { &*self.core.plugin };
         (plugin.stop_processing)(plugin);
         (plugin.deactivate)(plugin);
         (plugin.destroy)(plugin);
     }
 }
 
-/* ─────────────────────────── instruments: note events + ClapSynth ─────────────────────────── */
+/* ─────────────────── instruments: unified events + ClapSynth ─────────────────── */
+
+#[repr(C)]
+struct ClapEventParamValue {
+    header: ClapEventHeader,
+    param_id: u32,
+    cookie: *mut c_void,
+    note_id: i32,
+    port_index: i16,
+    channel: i16,
+    key: i16,
+    value: f64,
+}
+
+#[repr(C)]
+struct ClapEventMidi {
+    header: ClapEventHeader,
+    port_index: u16,
+    data: [u8; 3],
+}
+
+#[repr(C)]
+struct ClapPluginLatency {
+    get: extern "C" fn(*const ClapPlugin) -> u32,
+}
+
+#[repr(C)]
+struct ClapParamInfo {
+    id: u32,
+    flags: u32,
+    cookie: *mut c_void,
+    name: [c_char; CLAP_NAME_SIZE],
+    module: [c_char; 1024], // CLAP_PATH_SIZE
+    min_value: f64,
+    max_value: f64,
+    default_value: f64,
+}
+
+impl ClapParamInfo {
+    fn zeroed() -> Self {
+        Self {
+            id: 0,
+            flags: 0,
+            cookie: std::ptr::null_mut(),
+            name: [0; CLAP_NAME_SIZE],
+            module: [0; 1024],
+            min_value: 0.0,
+            max_value: 0.0,
+            default_value: 0.0,
+        }
+    }
+}
+
+#[repr(C)]
+struct ClapPluginParams {
+    count: extern "C" fn(*const ClapPlugin) -> u32,
+    get_info: extern "C" fn(*const ClapPlugin, u32, *mut ClapParamInfo) -> bool,
+    get_value: extern "C" fn(*const ClapPlugin, u32, *mut f64) -> bool,
+    value_to_text: extern "C" fn(*const ClapPlugin, u32, f64, *mut c_char, u32) -> bool,
+    text_to_value: extern "C" fn(*const ClapPlugin, u32, *const c_char, *mut f64) -> bool,
+    flush: extern "C" fn(*const ClapPlugin, *const ClapInputEvents, *const ClapOutputEvents),
+}
+
+/// Backing storage for one tile's input event list: notes, parameter values,
+/// and bridged MIDI, spec-sorted. Rebuilt per tile on the stack.
+enum StoredEvent {
+    Note(ClapEventNote),
+    Param(ClapEventParamValue),
+    Midi(ClapEventMidi),
+}
+
+impl StoredEvent {
+    fn time(&self) -> u32 {
+        match self {
+            StoredEvent::Note(e) => e.header.time,
+            StoredEvent::Param(e) => e.header.time,
+            StoredEvent::Midi(e) => e.header.time,
+        }
+    }
+}
+
+#[derive(Default)]
+struct EventSet {
+    storage: Vec<StoredEvent>,
+    // Rebuilt by sort_and_index(); raw pointers valid until the next mutation.
+    headers: Vec<*const ClapEventHeader>,
+}
+
+impl EventSet {
+    fn push_note(&mut self, time: u32, on: bool, key: u8, velocity: f64) {
+        self.storage.push(StoredEvent::Note(ClapEventNote {
+            header: ClapEventHeader {
+                size: std::mem::size_of::<ClapEventNote>() as u32,
+                time,
+                space_id: 0,
+                type_: if on {
+                    CLAP_EVENT_NOTE_ON
+                } else {
+                    CLAP_EVENT_NOTE_OFF
+                },
+                flags: 0,
+            },
+            note_id: -1,
+            port_index: 0,
+            channel: 0,
+            key: key as i16,
+            velocity: if on { velocity } else { 0.0 },
+        }));
+    }
+
+    fn push_param(&mut self, time: u32, param_id: u32, value: f64) {
+        self.storage.push(StoredEvent::Param(ClapEventParamValue {
+            header: ClapEventHeader {
+                size: std::mem::size_of::<ClapEventParamValue>() as u32,
+                time,
+                space_id: 0,
+                type_: CLAP_EVENT_PARAM_VALUE,
+                flags: 0,
+            },
+            param_id,
+            cookie: std::ptr::null_mut(),
+            note_id: -1,
+            port_index: -1,
+            channel: -1,
+            key: -1,
+            value,
+        }));
+    }
+
+    fn push_midi(&mut self, time: u32, data: [u8; 3]) {
+        self.storage.push(StoredEvent::Midi(ClapEventMidi {
+            header: ClapEventHeader {
+                size: std::mem::size_of::<ClapEventMidi>() as u32,
+                time,
+                space_id: 0,
+                type_: CLAP_EVENT_MIDI,
+                flags: 0,
+            },
+            port_index: 0,
+            data,
+        }));
+    }
+
+    /// Spec: input events must be sample-sorted. Stable, so events pushed
+    /// earlier at the same sample keep their order (params before notes).
+    fn sort_and_index(&mut self) {
+        self.storage.sort_by_key(StoredEvent::time);
+        self.headers = self
+            .storage
+            .iter()
+            .map(|e| match e {
+                StoredEvent::Note(e) => &e.header as *const ClapEventHeader,
+                StoredEvent::Param(e) => &e.header as *const ClapEventHeader,
+                StoredEvent::Midi(e) => &e.header as *const ClapEventHeader,
+            })
+            .collect();
+    }
+
+    fn as_input(&mut self) -> ClapInputEvents {
+        ClapInputEvents {
+            ctx: self as *mut EventSet as *mut c_void,
+            size: event_set_size,
+            get: event_set_get,
+        }
+    }
+}
+
+extern "C" fn event_set_size(list: *const ClapInputEvents) -> u32 {
+    let set = unsafe { &*((*list).ctx as *const EventSet) };
+    set.headers.len() as u32
+}
+extern "C" fn event_set_get(list: *const ClapInputEvents, index: u32) -> *const ClapEventHeader {
+    let set = unsafe { &*((*list).ctx as *const EventSet) };
+    set.headers
+        .get(index as usize)
+        .copied()
+        .unwrap_or(std::ptr::null())
+}
 
 #[repr(C)]
 struct ClapEventNote {
@@ -673,69 +947,145 @@ pub struct NoteEvent {
     pub velocity: f32,
 }
 
-struct EventsSlice {
-    data: *const ClapEventNote,
-    len: usize,
-}
-extern "C" fn note_events_size(list: *const ClapInputEvents) -> u32 {
-    let s = unsafe { &*((*list).ctx as *const EventsSlice) };
-    s.len as u32
-}
-extern "C" fn note_events_get(list: *const ClapInputEvents, index: u32) -> *const ClapEventHeader {
-    let s = unsafe { &*((*list).ctx as *const EventsSlice) };
-    if (index as usize) >= s.len {
-        return std::ptr::null();
-    }
-    unsafe { s.data.add(index as usize) as *const ClapEventHeader }
+/// Which note dialect the instance speaks to its instrument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoteDialect {
+    Clap,
+    Midi,
 }
 
-/// Filter the absolute-timeline events down to one tile and convert to the
-/// spec's `clap_event_note`, sorted by sample time (spec requirement). Events
-/// carry note_id -1 / port 0 / channel 0 per the lowest-common-denominator
-/// CLAP dialect.
-fn notes_as_process_events(
-    tile_abs: usize,
-    tile_frames: usize,
-    events: &[NoteEvent],
-) -> Vec<ClapEventNote> {
-    let mut out: Vec<ClapEventNote> = events
-        .iter()
-        .filter(|e| e.abs_frame >= tile_abs && e.abs_frame < tile_abs + tile_frames)
-        .map(|e| ClapEventNote {
-            header: ClapEventHeader {
-                size: std::mem::size_of::<ClapEventNote>() as u32,
-                time: (e.abs_frame - tile_abs) as u32,
-                space_id: 0,
-                type_: if e.on {
-                    CLAP_EVENT_NOTE_ON
-                } else {
-                    CLAP_EVENT_NOTE_OFF
-                },
-                flags: 0,
-            },
-            note_id: -1,
-            port_index: 0,
-            channel: 0,
-            key: e.key as i16,
-            velocity: if e.on {
-                e.velocity.clamp(0.0, 1.0) as f64
-            } else {
-                0.0
-            },
-        })
-        .collect();
-    out.sort_by_key(|e| e.header.time); // stable: same-sample events keep caller order
+/// User-facing parameter descriptor (hidden/readonly/bypass params filtered).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParamInfo {
+    pub id: u32,
+    pub name: String,
+    pub module: String,
+    pub min_value: f64,
+    pub max_value: f64,
+    pub default_value: f64,
+}
+
+fn read_clap_string(buf: &[c_char]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let bytes: Vec<u8> = buf[..end].iter().map(|&c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Enumerate a plugin's user-facing parameters, or empty when the plugin
+/// exports no params extension.
+fn read_params(plugin: &ClapPlugin) -> Vec<ParamInfo> {
+    const HIDE_FLAGS: u32 = (1 << 2) | (1 << 3) | (1 << 4); // hidden | readonly | bypass
+    let ext = (plugin.get_extension)(plugin, CLAP_EXT_PARAMS.as_ptr() as *const c_char)
+        as *const ClapPluginParams;
+    let Some(ext) = (unsafe { ext.as_ref() }) else {
+        return Vec::new();
+    };
+    let count = (ext.count)(plugin).min(4096);
+    let mut out = Vec::new();
+    for i in 0..count {
+        let mut info = ClapParamInfo::zeroed();
+        if !(ext.get_info)(plugin, i, &mut info) {
+            continue;
+        }
+        if info.flags & HIDE_FLAGS != 0 {
+            continue;
+        }
+        out.push(ParamInfo {
+            id: info.id,
+            name: read_clap_string(&info.name),
+            module: read_clap_string(&info.module),
+            min_value: info.min_value,
+            max_value: info.max_value,
+            default_value: info.default_value,
+        });
+    }
     out
 }
 
+/// Load a plugin just long enough to enumerate its parameters (params are
+/// queryable while deactivated per spec).
+pub fn inspect_params(path: &Path, plugin_id: &str) -> Result<Vec<ParamInfo>> {
+    let bundle = unsafe { open_bundle(path)? };
+    let path_c = CString::new(path.to_string_lossy().as_ref())?;
+    if !(bundle.entry.init)(path_c.as_ptr()) {
+        anyhow::bail!("entry init() failed for {}", path.display());
+    }
+    struct DeinitGuard<'e>(&'e ClapPluginEntry);
+    impl Drop for DeinitGuard<'_> {
+        fn drop(&mut self) {
+            (self.0.deinit)();
+        }
+    }
+    let _g = DeinitGuard(bundle.entry);
+    let factory = (bundle.entry.get_factory)(CLAP_PLUGIN_FACTORY_ID.as_ptr() as *const c_char)
+        as *const ClapPluginFactory;
+    let factory = unsafe { factory.as_ref() }.context("no plugin factory")?;
+    let id_c = CString::new(plugin_id)?;
+    let plugin = (factory.create_plugin)(factory, host_struct(), id_c.as_ptr());
+    let plugin_ref = unsafe { plugin.as_ref() }.context("create_plugin returned null")?;
+    if !(plugin_ref.init)(plugin_ref) {
+        anyhow::bail!("plugin init failed for {}", plugin_id);
+    }
+    struct DestroyGuard(*const ClapPlugin);
+    impl Drop for DestroyGuard {
+        fn drop(&mut self) {
+            let p = unsafe { &*self.0 };
+            (p.destroy)(p);
+        }
+    }
+    let _pg = DestroyGuard(plugin);
+    Ok(read_params(plugin_ref))
+}
+
+/// Filter the absolute-timeline notes into `set` for one tile, in whichever
+/// dialect the instance negotiated.
+fn push_notes(
+    set: &mut EventSet,
+    tile_abs: usize,
+    tile_frames: usize,
+    events: &[NoteEvent],
+    dialect: NoteDialect,
+) {
+    for e in events
+        .iter()
+        .filter(|e| e.abs_frame >= tile_abs && e.abs_frame < tile_abs + tile_frames)
+    {
+        let time = (e.abs_frame - tile_abs) as u32;
+        match dialect {
+            NoteDialect::Clap => {
+                let vel = if e.on {
+                    e.velocity.clamp(0.0, 1.0) as f64
+                } else {
+                    0.0
+                };
+                set.push_note(time, e.on, e.key, vel);
+            }
+            NoteDialect::Midi => {
+                let vel127 = if e.on {
+                    (e.velocity.clamp(0.0, 1.0) * 127.0)
+                        .round()
+                        .clamp(1.0, 127.0) as u8
+                } else {
+                    0
+                };
+                set.push_midi(time, [if e.on { 0x90 } else { 0x80 }, e.key, vel127]);
+            }
+        }
+    }
+}
+
 /// The testable heart of [`ClapSynth`]: everything except dynamic loading.
-/// Kept separate so unit tests can drive the production rendering machinery
-/// against an in-process plugin.
 struct SynthCore {
     plugin: *const ClapPlugin,
     out_channels: usize,
     world_pos: usize,
+    /// Declared latency in frames. Per-track latencies *are* compensated by
+    /// the host (every track is shifted to the slowest plugin track — the
+    /// classic PDC pattern), so tracks stay sample-aligned against each other.
+    latency: usize,
     stopped: bool,
+    pending_params: Vec<(u32, f64)>,
+    dialect: NoteDialect,
 }
 // SAFETY: identical reasoning as ClapFx — single-threaded ownership at a time.
 unsafe impl Send for SynthCore {}
@@ -746,8 +1096,15 @@ impl SynthCore {
             plugin,
             out_channels,
             world_pos: 0,
+            latency: 0,
             stopped: false,
+            pending_params: Vec::new(),
+            dialect: NoteDialect::Clap,
         }
+    }
+
+    fn set_param(&mut self, id: u32, value: f64) {
+        self.pending_params.push((id, value));
     }
 
     /// Advance the synth over the absolute window
@@ -763,6 +1120,10 @@ impl SynthCore {
         if self.stopped {
             return;
         }
+        self.run_span(dst, events);
+    }
+
+    fn run_span(&mut self, dst: &mut [f32], events: &[NoteEvent]) {
         let total = dst.len() / 2;
         let mut off = 0usize;
         while off < total {
@@ -785,16 +1146,16 @@ impl SynthCore {
         let tile_abs = self.world_pos;
         let plugin = unsafe { &*self.plugin };
 
-        let evs = notes_as_process_events(tile_abs, n, events);
-        let event_slice = EventsSlice {
-            data: evs.as_ptr(),
-            len: evs.len(),
-        };
-        let in_events = ClapInputEvents {
-            ctx: &event_slice as *const EventsSlice as *mut c_void,
-            size: note_events_size,
-            get: note_events_get,
-        };
+        let mut set = EventSet::default();
+        if !self.pending_params.is_empty() {
+            self.pending_params.sort_by_key(|p| p.0);
+            for (id, v) in self.pending_params.drain(..) {
+                set.push_param(0, id, v);
+            }
+        }
+        push_notes(&mut set, tile_abs, n, events, self.dialect);
+        set.sort_and_index();
+        let in_events = set.as_input();
 
         let mut out_bufs = vec![vec![0.0_f32; n]; self.out_channels.max(1)];
         let mut out_ptrs: Vec<*mut f32> = out_bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
@@ -845,9 +1206,9 @@ pub struct ClapSynth {
 unsafe impl Send for ClapSynth {}
 
 impl ClapSynth {
-    /// Load and activate an instrument plugin at `sr`. Note ports are
-    /// optional in the spec; when present they must accept the CLAP dialect,
-    /// otherwise loading fails loudly instead of producing silence.
+    /// Load and activate an instrument plugin at `sr`. The note-port dialect
+    /// is negotiated as CLAP first, bridged MIDI second; anything else fails
+    /// loudly instead of producing silence.
     pub fn load(path: &Path, plugin_id: &str, sr: u32) -> Result<Self> {
         let bundle = unsafe { open_bundle(path)? };
         let path_c = CString::new(path.to_string_lossy().as_ref())?;
@@ -864,7 +1225,7 @@ impl ClapSynth {
             anyhow::bail!("plugin init failed for {}", plugin_id);
         }
 
-        // note port validation
+        let mut dialect = NoteDialect::Clap;
         let note_ext =
             (plugin_ref.get_extension)(plugin_ref, CLAP_EXT_NOTE_PORTS.as_ptr() as *const c_char)
                 as *const ClapPluginNotePorts;
@@ -877,9 +1238,15 @@ impl ClapSynth {
                     preferred_dialect: 0,
                     name: [0; CLAP_NAME_SIZE],
                 };
-                if (ext.get)(plugin_ref, 0, true, &mut info) && info.supported_dialects & 1 == 0 {
-                    (plugin_ref.destroy)(plugin_ref);
-                    anyhow::bail!("{} accepts no CLAP-dialect note events", plugin_id);
+                if (ext.get)(plugin_ref, 0, true, &mut info) {
+                    if info.supported_dialects & CLAP_NOTE_DIALECT_CLAP != 0 {
+                        dialect = NoteDialect::Clap;
+                    } else if info.supported_dialects & CLAP_NOTE_DIALECT_MIDI != 0 {
+                        dialect = NoteDialect::Midi;
+                    } else {
+                        (plugin_ref.destroy)(plugin_ref);
+                        anyhow::bail!("{} speaks neither CLAP nor MIDI note dialects", plugin_id);
+                    }
                 }
             }
         }
@@ -898,8 +1265,11 @@ impl ClapSynth {
             (plugin_ref.destroy)(plugin_ref);
             anyhow::bail!("start_processing failed for {}", plugin_id);
         }
+        let mut core = SynthCore::new(plugin, out_channels);
+        core.dialect = dialect;
+        core.latency = plugin_latency(plugin_ref).min(MAX_LATENCY_PRIME);
         Ok(ClapSynth {
-            core: SynthCore::new(plugin, out_channels),
+            core,
             _bundle: bundle,
         })
     }
@@ -907,6 +1277,34 @@ impl ClapSynth {
     /// See [`SynthCore::render_window`].
     pub fn render_window(&mut self, dst: &mut [f32], abs_start: usize, events: &[NoteEvent]) {
         self.core.render_window(dst, abs_start, events);
+    }
+
+    /// Queue an initial parameter batch, delivered as time-0 PARAM_VALUE
+    /// events on the first processed tile.
+    pub fn apply_initial(&mut self, params: &[(u32, f64)]) {
+        for &(id, v) in params {
+            self.core.set_param(id, v);
+        }
+    }
+
+    /// Queue a parameter change for the next processed tile.
+    pub fn set_param(&mut self, id: u32, value: f64) {
+        self.core.set_param(id, value);
+    }
+
+    /// Enumerate the plugin's user-facing parameters.
+    pub fn list_params(&self) -> Vec<ParamInfo> {
+        read_params(unsafe { &*self.core.plugin })
+    }
+
+    /// The negotiated note dialect.
+    pub fn dialect(&self) -> NoteDialect {
+        self.core.dialect
+    }
+
+    /// Declared plugin latency in frames, for the track-alignment PDC pass.
+    pub fn latency(&self) -> usize {
+        self.core.latency
     }
 }
 
@@ -1603,5 +2001,464 @@ mod tests {
             "persistent instance + absolute events must be bit-identical across chunking"
         );
         assert!(whole.iter().any(|v| v.abs() > 1e-3));
+    }
+
+    // ── Fixture: latency-reporting delay FX (for PDC) ──
+
+    const LAT_SAMPLES: usize = 64;
+    struct LatState {
+        l: [f32; LAT_SAMPLES],
+        r: [f32; LAT_SAMPLES],
+        pos: usize,
+    }
+    static LAT_STATE: std::sync::Mutex<LatState> = std::sync::Mutex::new(LatState {
+        l: [0.0; LAT_SAMPLES],
+        r: [0.0; LAT_SAMPLES],
+        pos: 0,
+    });
+
+    extern "C" fn lat_get_extension(_p: *const ClapPlugin, id: *const c_char) -> *const c_void {
+        let id = unsafe { CStr::from_ptr(id) }.to_bytes();
+        if id == b"clap.audio-ports" {
+            static PORTS: SyncStatic<ClapPluginAudioPorts> = SyncStatic(ClapPluginAudioPorts {
+                count: ports_count,
+                get: ports_get,
+            });
+            &PORTS.0 as *const ClapPluginAudioPorts as *const c_void
+        } else if id == b"clap.latency" {
+            static LAT: SyncStatic<ClapPluginLatency> = SyncStatic(ClapPluginLatency {
+                get: lat_latency_get,
+            });
+            &LAT.0 as *const ClapPluginLatency as *const c_void
+        } else {
+            std::ptr::null()
+        }
+    }
+    extern "C" fn lat_latency_get(_p: *const ClapPlugin) -> u32 {
+        LAT_SAMPLES as u32
+    }
+    extern "C" fn lat_process(_p: *const ClapPlugin, proc: *const ClapProcess) -> i32 {
+        let proc = unsafe { &*proc };
+        let n = proc.frames_count as usize;
+        let inputs = unsafe { &*proc.audio_inputs };
+        let outputs = unsafe { &mut *proc.audio_outputs };
+        let in_l = unsafe { std::slice::from_raw_parts(*inputs.data32, n) };
+        let in_r = unsafe { std::slice::from_raw_parts(*inputs.data32.add(1), n) };
+        let out_l = unsafe { std::slice::from_raw_parts_mut(*outputs.data32, n) };
+        let out_r = unsafe { std::slice::from_raw_parts_mut(*outputs.data32.add(1), n) };
+        let mut st = LAT_STATE.lock().unwrap();
+        for i in 0..n {
+            let pos = st.pos;
+            let ol = st.l[pos];
+            let orr = st.r[pos];
+            st.l[pos] = in_l[i];
+            st.r[pos] = in_r[i];
+            st.pos = (pos + 1) % LAT_SAMPLES;
+            out_l[i] = ol;
+            out_r[i] = orr;
+        }
+        1
+    }
+    fn make_lat_plugin() -> Box<ClapPlugin> {
+        Box::new(ClapPlugin {
+            desc: std::ptr::null(),
+            plugin_data: std::ptr::null_mut(),
+            init: p_init,
+            destroy: p_destroy,
+            activate: p_activate,
+            deactivate: p_deactivate,
+            start_processing: p_start,
+            stop_processing: p_stop,
+            reset: p_reset,
+            process: lat_process,
+            get_extension: lat_get_extension,
+            on_main_thread: p_on_main,
+        })
+    }
+
+    /// Master-bus latency is deliberately *not* compensated: the declared
+    /// latency is reported, and the (unaffected, whole-mix) shift passes
+    /// through bit-identically in both render paths. Track-level latencies
+    /// are what the PDC shift machinery aligns (see audio::tests).
+    #[test]
+    fn master_latency_is_reported_and_uniform() {
+        let _g = SYNTH_TEST.lock().unwrap();
+        *LAT_STATE.lock().unwrap() = LatState {
+            l: [0.0; LAT_SAMPLES],
+            r: [0.0; LAT_SAMPLES],
+            pos: 0,
+        };
+        let plugin = make_lat_plugin();
+        let plugin_ref: &'static ClapPlugin = Box::leak(plugin);
+        let (in_ch, out_ch) = inspect_ports(plugin_ref);
+        assert_eq!((in_ch, out_ch), (2, 2));
+        let mut core = FxCore::with_latency(plugin_ref, in_ch, out_ch, plugin_latency(plugin_ref));
+        assert_eq!(core.latency, LAT_SAMPLES);
+
+        let mut buf = vec![0.0_f32; 300 * 2];
+        buf[0] = 1.0;
+        core.process_chunk(&mut buf);
+        assert_eq!(buf[LAT_SAMPLES * 2], 1.0, "impulse rides the uniform shift");
+        assert!(buf[..LAT_SAMPLES * 2].iter().all(|v| *v == 0.0));
+    }
+
+    /// Unprimed, the same plugin must delay by its declared latency — proves
+    /// the fixture actually delays (and the prime is what does the aligning).
+    #[test]
+    fn unprimed_fixture_delays_by_declared_latency() {
+        let _g = SYNTH_TEST.lock().unwrap();
+        *LAT_STATE.lock().unwrap() = LatState {
+            l: [0.0; LAT_SAMPLES],
+            r: [0.0; LAT_SAMPLES],
+            pos: 0,
+        };
+        let plugin = make_lat_plugin();
+        let plugin_ref: &'static ClapPlugin = Box::leak(plugin);
+        let mut core = FxCore::new(plugin_ref, 2, 2); // no priming
+        let mut buf = vec![0.0_f32; 300 * 2];
+        buf[0] = 1.0;
+        core.process_chunk(&mut buf);
+        assert_eq!(buf[LAT_SAMPLES * 2], 1.0);
+        assert!(buf[..LAT_SAMPLES * 2].iter().all(|v| *v == 0.0));
+    }
+
+    // ── Fixture: parameterized gain FX (for param hosting) ──
+
+    struct ParamState {
+        log: Vec<(u32, usize, f64)>,
+        gain: f64,
+    }
+    static PARAM_STATE: std::sync::Mutex<ParamState> = std::sync::Mutex::new(ParamState {
+        log: Vec::new(),
+        gain: 1.0,
+    });
+
+    extern "C" fn par_get_extension(_p: *const ClapPlugin, id: *const c_char) -> *const c_void {
+        let id = unsafe { CStr::from_ptr(id) }.to_bytes();
+        if id == b"clap.audio-ports" {
+            static PORTS: SyncStatic<ClapPluginAudioPorts> = SyncStatic(ClapPluginAudioPorts {
+                count: ports_count,
+                get: ports_get,
+            });
+            &PORTS.0 as *const ClapPluginAudioPorts as *const c_void
+        } else if id == b"clap.params" {
+            static PARAMS: SyncStatic<ClapPluginParams> = SyncStatic(ClapPluginParams {
+                count: par_count,
+                get_info: par_get_info,
+                get_value: par_get_value,
+                value_to_text: par_value_to_text,
+                text_to_value: par_text_to_value,
+                flush: par_flush,
+            });
+            &PARAMS.0 as *const ClapPluginParams as *const c_void
+        } else {
+            std::ptr::null()
+        }
+    }
+    extern "C" fn par_count(_p: *const ClapPlugin) -> u32 {
+        3
+    }
+    fn write_cstr(buf: &mut [c_char], text: &str) {
+        for (i, b) in text.as_bytes().iter().enumerate() {
+            buf[i] = *b as c_char;
+        }
+        buf[text.len()] = 0;
+    }
+    extern "C" fn par_get_info(
+        _p: *const ClapPlugin,
+        index: u32,
+        info: *mut ClapParamInfo,
+    ) -> bool {
+        let info = unsafe { &mut *info };
+        match index {
+            0 => {
+                info.id = 7;
+                info.flags = 0;
+                write_cstr(&mut info.name, "Gain");
+                write_cstr(&mut info.module, "Master");
+                info.min_value = 0.0;
+                info.max_value = 2.0;
+                info.default_value = 1.0;
+                true
+            }
+            1 => {
+                info.id = 42;
+                info.flags = 0;
+                write_cstr(&mut info.name, "Cutoff");
+                write_cstr(&mut info.module, "Filter");
+                info.min_value = 20.0;
+                info.max_value = 20_000.0;
+                info.default_value = 1_000.0;
+                true
+            }
+            2 => {
+                info.id = 99;
+                info.flags = 1 << 2; // hidden — must be filtered by the host
+                write_cstr(&mut info.name, "Hidden");
+                info.min_value = 0.0;
+                info.max_value = 1.0;
+                info.default_value = 0.0;
+                true
+            }
+            _ => false,
+        }
+    }
+    extern "C" fn par_get_value(_p: *const ClapPlugin, id: u32, out: *mut f64) -> bool {
+        if id == 7 {
+            unsafe { *out = PARAM_STATE.lock().unwrap().gain };
+            true
+        } else {
+            false
+        }
+    }
+    extern "C" fn par_value_to_text(
+        _p: *const ClapPlugin,
+        _id: u32,
+        _v: f64,
+        _b: *mut c_char,
+        _c: u32,
+    ) -> bool {
+        false
+    }
+    extern "C" fn par_text_to_value(
+        _p: *const ClapPlugin,
+        _id: u32,
+        _t: *const c_char,
+        _o: *mut f64,
+    ) -> bool {
+        false
+    }
+    extern "C" fn par_flush(
+        _p: *const ClapPlugin,
+        _i: *const ClapInputEvents,
+        _o: *const ClapOutputEvents,
+    ) {
+    }
+    extern "C" fn par_process(_p: *const ClapPlugin, proc: *const ClapProcess) -> i32 {
+        let proc = unsafe { &*proc };
+        let n = proc.frames_count as usize;
+        let in_events = unsafe { &*proc.in_events };
+        let ev_count = (in_events.size)(in_events) as usize;
+        let mut state = PARAM_STATE.lock().unwrap();
+        for i in 0..ev_count {
+            let hdr = (in_events.get)(in_events, i as u32);
+            let ev = unsafe { &*(hdr as *const ClapEventParamValue) };
+            if ev.header.type_ == CLAP_EVENT_PARAM_VALUE {
+                let abs = proc.steady_time as usize + ev.header.time as usize;
+                state.log.push((ev.param_id, abs, ev.value));
+                if ev.param_id == 7 {
+                    state.gain = ev.value;
+                }
+            }
+        }
+        drop(state);
+        let gain = PARAM_STATE.lock().unwrap().gain;
+        let inputs = unsafe { &*proc.audio_inputs };
+        let outputs = unsafe { &mut *proc.audio_outputs };
+        let in_l = unsafe { std::slice::from_raw_parts(*inputs.data32, n) };
+        let in_r = unsafe { std::slice::from_raw_parts(*inputs.data32.add(1), n) };
+        let out_l = unsafe { std::slice::from_raw_parts_mut(*outputs.data32, n) };
+        let out_r = unsafe { std::slice::from_raw_parts_mut(*outputs.data32.add(1), n) };
+        for i in 0..n {
+            out_l[i] = in_l[i] * gain as f32;
+            out_r[i] = in_r[i] * gain as f32;
+        }
+        1
+    }
+    fn make_param_plugin() -> Box<ClapPlugin> {
+        Box::new(ClapPlugin {
+            desc: std::ptr::null(),
+            plugin_data: std::ptr::null_mut(),
+            init: p_init,
+            destroy: p_destroy,
+            activate: p_activate,
+            deactivate: p_deactivate,
+            start_processing: p_start,
+            stop_processing: p_stop,
+            reset: p_reset,
+            process: par_process,
+            get_extension: par_get_extension,
+            on_main_thread: p_on_main,
+        })
+    }
+
+    /// Parameter hosting: enumeration filters hidden params, events arrive at
+    /// sample 0 of the next tile, and the plugin hears the exact value.
+    #[test]
+    fn params_enumerate_and_flow_sample_accurately() {
+        let _g = SYNTH_TEST.lock().unwrap();
+        *PARAM_STATE.lock().unwrap() = ParamState {
+            log: Vec::new(),
+            gain: 1.0,
+        };
+        let plugin = make_param_plugin();
+        let plugin_ref: &'static ClapPlugin = Box::leak(plugin);
+
+        let params = read_params(plugin_ref);
+        assert_eq!(params.len(), 2, "hidden param must be filtered");
+        assert_eq!(params[0].id, 7);
+        assert_eq!(params[0].name, "Gain");
+        assert_eq!(params[0].module, "Master");
+        assert_eq!(
+            (
+                params[0].min_value,
+                params[0].max_value,
+                params[0].default_value
+            ),
+            (0.0, 2.0, 1.0)
+        );
+        assert_eq!(params[1].id, 42);
+
+        let mut core = FxCore::new(plugin_ref, 2, 2);
+        core.set_param(7, 0.5);
+        let mut buf = vec![0.25_f32; 256 * 2];
+        core.process_chunk(&mut buf);
+        let log = PARAM_STATE.lock().unwrap().log.clone();
+        assert_eq!(log, vec![(7u32, 0usize, 0.5f64)]);
+        assert!(
+            buf.iter().all(|v| (*v - 0.125).abs() < 1e-6),
+            "gain applied at sample 0"
+        );
+    }
+
+    // ── Fixture: MIDI-dialect instrument (for dialect bridging) ──
+
+    struct MidiState {
+        log: Vec<[u8; 3]>,
+        on: [bool; 128],
+    }
+    static MIDI_STATE: std::sync::Mutex<MidiState> = std::sync::Mutex::new(MidiState {
+        log: Vec::new(),
+        on: [false; 128],
+    });
+
+    extern "C" fn midi_note_get(
+        _p: *const ClapPlugin,
+        _i: u32,
+        is_input: bool,
+        info: *mut ClapNotePortInfo,
+    ) -> bool {
+        if !is_input {
+            return false;
+        }
+        let info = unsafe { &mut *info };
+        info.supported_dialects = 2; // MIDI only — no CLAP dialect here
+        info.preferred_dialect = 2;
+        true
+    }
+    extern "C" fn midi_get_extension(_p: *const ClapPlugin, id: *const c_char) -> *const c_void {
+        let id = unsafe { CStr::from_ptr(id) }.to_bytes();
+        if id == b"clap.note-ports" {
+            static PORTS: SyncStatic<ClapPluginNotePorts> = SyncStatic(ClapPluginNotePorts {
+                count: syn_note_count,
+                get: midi_note_get,
+            });
+            &PORTS.0 as *const ClapPluginNotePorts as *const c_void
+        } else if id == b"clap.audio-ports" {
+            static PORTS: SyncStatic<ClapPluginAudioPorts> = SyncStatic(ClapPluginAudioPorts {
+                count: syn_audio_count,
+                get: syn_audio_get,
+            });
+            &PORTS.0 as *const ClapPluginAudioPorts as *const c_void
+        } else {
+            std::ptr::null()
+        }
+    }
+    extern "C" fn midi_process(_p: *const ClapPlugin, proc: *const ClapProcess) -> i32 {
+        let proc = unsafe { &*proc };
+        let n = proc.frames_count as usize;
+        let in_events = unsafe { &*proc.in_events };
+        let ev_count = (in_events.size)(in_events) as usize;
+        let outputs = unsafe { &mut *proc.audio_outputs };
+        let out_l = unsafe { std::slice::from_raw_parts_mut(*outputs.data32, n) };
+        let out_r = unsafe { std::slice::from_raw_parts_mut(*outputs.data32.add(1), n) };
+        let mut state = MIDI_STATE.lock().unwrap();
+        let mut cursor = 0usize;
+        for i in 0..n {
+            while cursor < ev_count {
+                let hdr = (in_events.get)(in_events, cursor as u32);
+                let ev = unsafe { &*(hdr as *const ClapEventMidi) };
+                if ev.header.time as usize > i {
+                    break;
+                }
+                assert_eq!(ev.header.type_, CLAP_EVENT_MIDI);
+                state.log.push(ev.data);
+                let status = ev.data[0] & 0xF0;
+                let key = ev.data[1] as usize;
+                if status == 0x90 && ev.data[2] > 0 {
+                    state.on[key] = true;
+                } else if status == 0x80 || (status == 0x90 && ev.data[2] == 0) {
+                    state.on[key] = false;
+                }
+                cursor += 1;
+            }
+            let acc: f32 = if state.on.iter().any(|v| *v) {
+                0.2
+            } else {
+                0.0
+            };
+            out_l[i] = acc;
+            out_r[i] = acc;
+        }
+        1
+    }
+    fn make_midi_synth() -> Box<ClapPlugin> {
+        Box::new(ClapPlugin {
+            desc: std::ptr::null(),
+            plugin_data: std::ptr::null_mut(),
+            init: p_init,
+            destroy: p_destroy,
+            activate: p_activate,
+            deactivate: p_deactivate,
+            start_processing: p_start,
+            stop_processing: p_stop,
+            reset: p_reset,
+            process: midi_process,
+            get_extension: midi_get_extension,
+            on_main_thread: p_on_main,
+        })
+    }
+
+    /// MIDI-dialect bridging: a MIDI-only instrument receives 0x90/0x80 frames
+    /// with velocity mapped to 1..127, and its gate behaves accordingly.
+    #[test]
+    fn midi_dialect_is_bridged() {
+        let _g = SYNTH_TEST.lock().unwrap();
+        *MIDI_STATE.lock().unwrap() = MidiState {
+            log: Vec::new(),
+            on: [false; 128],
+        };
+        let plugin = make_midi_synth();
+        let plugin_ref: &'static ClapPlugin = Box::leak(plugin);
+
+        // Host-side negotiation: MIDI-only port must select Midi.
+        // (ClapSynth::load does this; here we exercise the core directly.)
+        let mut core = SynthCore::new(plugin_ref, 2);
+        core.dialect = NoteDialect::Midi;
+
+        let mut buf = vec![0.0_f32; 400 * 2];
+        core.render_window(
+            &mut buf,
+            0,
+            &[
+                NoteEvent {
+                    abs_frame: 10,
+                    on: true,
+                    key: 60,
+                    velocity: 0.5,
+                },
+                NoteEvent {
+                    abs_frame: 200,
+                    on: false,
+                    key: 60,
+                    velocity: 0.0,
+                },
+            ],
+        );
+        let log = MIDI_STATE.lock().unwrap().log.clone();
+        assert_eq!(log, vec![[0x90, 60, 64], [0x80, 60, 0]]);
+        assert!(buf[..10 * 2].iter().all(|v| *v == 0.0));
+        assert!(buf[10 * 2..200 * 2].iter().all(|v| (*v - 0.2).abs() < 1e-7));
+        assert!(buf[200 * 2..].iter().all(|v| *v == 0.0));
     }
 }
