@@ -1,0 +1,9 @@
+/target/
+/build/
+/dist/
+/out/
+*.wav
+*.bcproj.json
+*_assets/
+.DS_Store
+Thumbs.db
