@@ -126,6 +126,20 @@ pub enum WavBitDepth {
     Float32,
 }
 
+/// A CLAP effect inserted on the master buss, after the Master Suite.
+/// Serialized by path + plugin id; projects bounce dry (with a stderr note)
+/// when the plugin is missing on the machine doing the render.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClapInsert {
+    /// Absolute path to the .clap bundle/file.
+    pub path: String,
+    /// Plugin id inside that bundle.
+    pub plugin_id: String,
+    /// Display name cached for the UI.
+    pub name: String,
+    pub enabled: bool,
+}
+
 /// Master-bus mastering chain: 3-band EQ → stereo width → compressor → limiter.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MasterSuite {
@@ -181,6 +195,9 @@ pub struct Project {
     /// 44100 or 48000; 0/invalid falls back to 44100 at use time.
     #[serde(default)]
     pub export_sample_rate: u32,
+    /// CLAP effect inserted on the master buss, after the Master Suite.
+    #[serde(default)]
+    pub master_clap: Option<ClapInsert>,
 }
 
 #[derive(Clone, Copy)]
@@ -481,6 +498,7 @@ pub fn default_project(studio_id: &str) -> Project {
         master_suite: MasterSuite::default(),
         export_bit_depth: WavBitDepth::default(),
         export_sample_rate: 44_100,
+        master_clap: None,
     }
 }
 

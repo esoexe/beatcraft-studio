@@ -24,7 +24,7 @@ The launcher uses subtle animated accent borders. During playback, a moving sequ
 
 ![Piano roll](screenshots/piano-roll.png)
 
-## V2.0 features
+## V2.5 features
 
 - **Four floors, one launcher** — BeatForge (drums), Drift (gliding bass), Boogie
   (keys/leads), Rhythm (polyrhythm layers) — each a complete standalone studio.
@@ -32,6 +32,13 @@ The launcher uses subtle animated accent borders. During playback, a moving sequ
   all editable with undo/redo everywhere.
 - **Full mixer** — per-track volume, pan, mute/solo, transient shaper, drive,
   chorus/delay send FX.
+- **CLAP plugin hosting** *(new in 2.5)* — insert any CLAP **audio effect**
+  found on your system at the end of the master chain (reverbs, saturators,
+  stereo tools…). Spec-compliant scan paths incl. `CLAP_PATH`, persistent
+  instance shared with the streaming engine so streamed bounces stay
+  bit-identical to offline renders, and projects degrade gracefully when the
+  plugin is missing on another machine. *(Headless for now: no plugin window,
+  parameters at factory state; instruments are next.)*
 - **True streaming engine** *(new in 2.0)* — bar-ahead render thread into a lock-free ring: instant playback start, flat memory on infinite arrangements, proven bit-identical to offline rendering on every floor.
 - **Varispeed warp** *(new in 2.0)* — "Fit" squeezes any sample take to exactly N sixteenths, MPC-style.
 - **Hardware MIDI-in** *(new in 1.2)* — connect any controller, arm MIDI REC, play along: notes quantize straight onto the grid, GM-mapped on drum floors, pitched on Drift/Boogie.

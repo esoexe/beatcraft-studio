@@ -2,6 +2,39 @@
 
 All notable changes to BeatCraft Studio are documented here.
 
+## [2.5.0] — 2026-10-18
+
+### Added — The Plugin Host release
+
+- **CLAP effect hosting on the master buss.** BeatCraft Studio now scans the
+  spec-standard CLAP locations (`~/.clap`, `/usr/lib/clap` on Linux,
+  `%COMMONPROGRAMFILES%\CLAP` and the `%LOCALAPPDATA%` variant on Windows,
+  `/Library/Audio/Plug-Ins/CLAP` and the per-user one on macOS — plus
+  `CLAP_PATH` everywhere), enumerates every `audio-effect` plugin it finds, and
+  lets you insert one at the very end of the master chain: after the Master
+  Suite, before the ceiling normalize. The host is a hand-built implementation
+  of the official CLAP 1.x C ABI (entry → plugin factory → activate →
+  `process()`), with exact-spec search paths and port negotiation — no wrapper
+  crates, just `libloading` and the spec. 24/24 tests.
+- **Streaming-true plugin rendering.** The insert is a persistent instance
+  shared by the offline renderer and the streaming engine, and every audio
+  buffer is retiled onto a global, absolute 512-frame grid before reaching the
+  plugin. A streamed bounce therefore makes the same `process()` calls with the
+  same `steady_time` values as an offline render — the v2.0 bit-parity contract
+  survives a plugin insert (chunk-invariance is unit-tested through the real
+  ABI structs; the plugin's own determinism is the only external factor).
+- **Mixer UI: CLAP FX picker** in the Master Suite group — scans once on first
+  open, "None" clears the insert, per-insert enable toggle. The insert
+  serializes with the project (`master_clap`); rendering on a machine that
+  lacks the plugin degrades to a dry bounce with a stderr note — renders never
+  fail over a missing plugin.
+
+### Not yet (honesty ledger)
+
+- **Effects only** — instruments and note-event delivery are the next milestone.
+- **Headless** — no plugin GUI embedding; parameters stay at factory defaults.
+- **No plugin-delay compensation** and no sidechain/multi-bus routing yet.
+
 ## [2.0.0] — 2026-10-18
 
 ### Added — The Streaming Mastering release

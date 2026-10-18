@@ -80,6 +80,8 @@ pub struct BeatCraftApp {
     last_midi_write: std::time::Instant,
     recovery_offer: Option<PathBuf>,
     autosave_written: Option<PathBuf>,
+    /// CLAP effects found on the system (scanned on first open of the mixer).
+    clap_effects: Option<std::rc::Rc<Vec<(PathBuf, crate::clap::PluginInfo)>>>,
 }
 
 impl BeatCraftApp {
@@ -141,6 +143,7 @@ impl BeatCraftApp {
             note_length: 2,
             piano_roll_scroll_initialized: false,
             selected_note: None,
+            clap_effects: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_autosave: std::time::Instant::now(),
@@ -597,6 +600,47 @@ impl BeatCraftApp {
                                 if ui.add(egui::Slider::new(&mut suite.stereo_width, 0.0..=2.0).text("Width")).changed() { actions.changed = true; }
                             });
                             ui.end_row();
+                        });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("CLAP FX").color(color("#E7C779")).small());
+                            if self.clap_effects.is_none() {
+                                self.clap_effects = Some(std::rc::Rc::new(crate::clap::scan_effects()));
+                            }
+                            let effects = self.clap_effects.clone().unwrap_or_default();
+                            let current = project
+                                .master_clap
+                                .as_ref()
+                                .map(|i| i.name.clone())
+                                .unwrap_or_else(|| "None".to_string());
+                            egui::ComboBox::from_id_salt("master-clap-fx")
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(project.master_clap.is_none(), "None").clicked() {
+                                        project.master_clap = None;
+                                        actions.changed = true;
+                                    }
+                                    if effects.is_empty() {
+                                        ui.label(RichText::new("No CLAP effects found on this system").small().color(color("#8792A2")));
+                                    }
+                                    for (path, info) in effects.iter() {
+                                        let selected = project.master_clap.as_ref().is_some_and(|i| i.plugin_id == info.id);
+                                        if ui.selectable_label(selected, format!("{}{}", info.name, if info.vendor.is_empty() { String::new() } else { format!(" — {}", info.vendor) })).clicked() {
+                                            project.master_clap = Some(crate::model::ClapInsert {
+                                                path: path.to_string_lossy().to_string(),
+                                                plugin_id: info.id.clone(),
+                                                name: info.name.clone(),
+                                                enabled: true,
+                                            });
+                                            actions.changed = true;
+                                        }
+                                    }
+                                });
+                            if let Some(insert) = &mut project.master_clap {
+                                if ui.checkbox(&mut insert.enabled, "enabled").changed() {
+                                    actions.changed = true;
+                                }
+                            }
                         });
                     });
                     ui.add_space(8.0);

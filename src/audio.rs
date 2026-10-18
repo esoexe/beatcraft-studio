@@ -108,9 +108,9 @@ pub fn render(project: &Project, sample_rate: u32) -> Result<Vec<f32>> {
     render_with_progress(project, sample_rate, None)
 }
 
-/// The complete mix signal chain up to and including the Master Suite, **before**
-/// the global ceiling normalize. This is the reference the streaming engine must
-/// reproduce sample-for-sample.
+/// The complete mix signal chain up to and including the Master Suite and any
+/// enabled master CLAP insert, **before** the global ceiling normalize. This is
+/// the reference the streaming engine must reproduce sample-for-sample.
 pub fn render_core(project: &Project, sample_rate: u32) -> Result<Vec<f32>> {
     render_core_impl(project, sample_rate, None)
 }
@@ -307,7 +307,27 @@ fn render_core_impl(
         peak = peak.max(sample.abs());
     }
     MasterSuiteState::new(&project.master_suite, sample_rate).process(&mut mix);
+    if let Some(mut fx) = master_fx_instance(project, sample_rate) {
+        fx.process_chunk(&mut mix);
+    }
     Ok(mix)
+}
+
+/// Instantiate the project's master CLAP insert, if one is set and enabled.
+/// Failures degrade to None so a bounce never fails over a missing plugin.
+fn master_fx_instance(project: &Project, sample_rate: u32) -> Option<crate::clap::ClapFx> {
+    let insert = project.master_clap.as_ref().filter(|i| i.enabled)?;
+    match crate::clap::ClapFx::load(
+        std::path::Path::new(&insert.path),
+        &insert.plugin_id,
+        sample_rate,
+    ) {
+        Ok(fx) => Some(fx),
+        Err(e) => {
+            eprintln!("CLAP insert '{}' skipped: {e}", insert.name);
+            None
+        }
+    }
 }
 
 /* ================= Master Suite: Edit-grade mastering chain =================
@@ -830,6 +850,9 @@ pub struct StreamingRender<'p> {
     included: Vec<usize>,
     tracks: Vec<StemStream>,
     suite: MasterSuiteState,
+    /// Persistent master CLAP instance; tiled on the global 512-frame grid so
+    /// chunked output stays bit-identical to the single-shot offline renderer.
+    master_fx: Option<crate::clap::ClapFx>,
     sample_cache: HashMap<String, SampleClip>,
     pattern_map: HashMap<&'p str, &'p Pattern>,
 }
@@ -871,6 +894,7 @@ impl<'p> StreamingRender<'p> {
             included,
             tracks,
             suite: MasterSuiteState::new(&project.master_suite, sample_rate),
+            master_fx: master_fx_instance(project, sample_rate),
             sample_cache: HashMap::new(),
             pattern_map: project
                 .patterns
@@ -965,6 +989,9 @@ impl<'p> StreamingRender<'p> {
             *sample = (*sample * master * (1.0 + drive * 3.0)).tanh();
         }
         self.suite.process(&mut mix);
+        if let Some(fx) = self.master_fx.as_mut() {
+            fx.process_chunk(&mut mix);
+        }
         self.bar += 1;
         self.next_frame = start_frame + w;
         Some(mix)

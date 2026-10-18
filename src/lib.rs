@@ -1,5 +1,6 @@
 pub mod app;
 pub mod audio;
+pub mod clap;
 pub mod engine;
 pub mod midi;
 pub mod model;
